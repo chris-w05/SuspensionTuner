@@ -1,8 +1,10 @@
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
@@ -30,6 +32,7 @@ class _AnalysisTabState extends State<AnalysisTab>
   AnalysisResult? _analysisResult;
   String? _selectedFileName;
   bool _isParsing = false;
+  bool _showMobileSidebar = false;
 
   late TabController _graphTabController;
   List<String> _timeChartOrder = <String>[
@@ -100,10 +103,13 @@ class _AnalysisTabState extends State<AnalysisTab>
 
 
     FilePickerResult? selection;
+    const List<String> allowedExtensions = <String>['bin', 'dat', 'raw', 'daq'];
+    final bool useCustomExtensionFilter =
+        defaultTargetPlatform != TargetPlatform.iOS;
     try {
       selection = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: <String>['bin', 'dat', 'raw', 'daq'],
+        type: useCustomExtensionFilter ? FileType.custom : FileType.any,
+        allowedExtensions: useCustomExtensionFilter ? allowedExtensions : null,
         withData: true,
       );
     } catch (error) {
@@ -115,12 +121,54 @@ class _AnalysisTabState extends State<AnalysisTab>
       return;
     }
 
-    if (selection == null || selection.files.single.bytes == null) {
+    if (selection == null || selection.files.isEmpty) {
       return;
     }
 
-    final String fileName = selection.files.single.name;
-    final Uint8List fileBytes = selection.files.single.bytes!;
+    final PlatformFile file = selection.files.single;
+    final String fileName = file.name;
+    final String loweredName = fileName.toLowerCase();
+    final bool isSupportedFile =
+        allowedExtensions.any((String ext) => loweredName.endsWith('.$ext'));
+    if (!isSupportedFile) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Unsupported file type. Choose one of: ${allowedExtensions.join(', ')}',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    Uint8List? fileBytes = file.bytes;
+    if (fileBytes == null && file.path != null) {
+      try {
+        fileBytes = await File(file.path!).readAsBytes();
+      } catch (error) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not read selected file: $error')),
+          );
+        }
+        return;
+      }
+    }
+
+    if (fileBytes == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not load file data from picker. Try moving the file to On My iPhone or Files > Downloads and try again.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
 
     setState(() {
       _isParsing = true;
@@ -143,6 +191,7 @@ class _AnalysisTabState extends State<AnalysisTab>
         _timeViewMinX = null;
         _timeViewMaxX = null;
         _scatterViewBounds.clear();
+        _showMobileSidebar = false;
       });
     } catch (error) {
       if (mounted) {
@@ -1403,6 +1452,10 @@ class _AnalysisTabState extends State<AnalysisTab>
 
   @override
   Widget build(BuildContext context) {
+    final MediaQueryData mediaQuery = MediaQuery.of(context);
+    final bool isCompactLayout = mediaQuery.size.width < 900;
+    final double textScale = isCompactLayout ? 0.9 : 1.0;
+
     final List<CalibrationProfile> profiles = widget.profiles;
 
     final AnalysisResult? result = _analysisResult;
@@ -1506,20 +1559,67 @@ class _AnalysisTabState extends State<AnalysisTab>
         globalMaxPosMm == null ||
         globalMinVelMmPerSecond == null ||
         globalMaxVelMmPerSecond == null) {
-      return Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          SizedBox(width: 280, child: sidebar),
-          const VerticalDivider(width: 1),
-          const Expanded(
-            child: Center(
-              child: Text(
-                'Select a log file to view analysis.',
-                style: TextStyle(color: Colors.grey),
-              ),
-            ),
+      final Widget emptyState = Center(
+        child: Text(
+          'Select a log file to view analysis.',
+          style: TextStyle(
+            color: Colors.grey.shade700,
+            fontSize: 13,
           ),
-        ],
+        ),
+      );
+
+      final Widget content = isCompactLayout
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        setState(() {
+                          _showMobileSidebar = !_showMobileSidebar;
+                        });
+                      },
+                      icon: Icon(
+                        _showMobileSidebar
+                            ? Icons.tune
+                            : Icons.tune_outlined,
+                        size: 18,
+                      ),
+                      label: Text(
+                        _showMobileSidebar ? 'Hide Controls' : 'Show Controls',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ),
+                ),
+                AnimatedCrossFade(
+                  duration: const Duration(milliseconds: 180),
+                  crossFadeState: _showMobileSidebar
+                      ? CrossFadeState.showFirst
+                      : CrossFadeState.showSecond,
+                  firstChild: SizedBox(height: 300, child: sidebar),
+                  secondChild: const SizedBox.shrink(),
+                ),
+                const Divider(height: 1),
+                Expanded(child: emptyState),
+              ],
+            )
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                SizedBox(width: 280, child: sidebar),
+                const VerticalDivider(width: 1),
+                Expanded(child: emptyState),
+              ],
+            );
+
+      return MediaQuery(
+        data: mediaQuery.copyWith(textScaler: TextScaler.linear(textScale)),
+        child: content,
       );
     }
 
@@ -1560,49 +1660,91 @@ class _AnalysisTabState extends State<AnalysisTab>
       ),
     );
 
-    return Row(
+    final Widget graphSection = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        SizedBox(width: 280, child: sidebar),
-        const VerticalDivider(width: 1),
+        TabBar(
+          controller: _graphTabController,
+          tabs: const <Tab>[
+            Tab(text: 'Trends'),
+            Tab(text: 'Time Correlation'),
+            Tab(text: 'Overview'),
+          ],
+        ),
         Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+          child: TabBarView(
+            controller: _graphTabController,
+            physics: const NeverScrollableScrollPhysics(),
             children: <Widget>[
-              TabBar(
-                controller: _graphTabController,
-                tabs: const <Tab>[
-                  Tab(text: 'Trends'),
-                  Tab(text: 'Time Correlation'),
-                  Tab(text: 'Overview'),
-                ],
+              _buildTrendsTab(
+                result,
+                globalMinPosMm: globalMinPosMm,
+                globalMaxPosMm: globalMaxPosMm,
+                globalMinVelMmPerSecond: globalMinVelMmPerSecond,
+                globalMaxVelMmPerSecond: globalMaxVelMmPerSecond,
               ),
-              Expanded(
-                child: TabBarView(
-                  controller: _graphTabController,
-                  physics: const NeverScrollableScrollPhysics(),
-                  children: <Widget>[
-                    _buildTrendsTab(
-                      result,
-                      globalMinPosMm: globalMinPosMm,
-                      globalMaxPosMm: globalMaxPosMm,
-                      globalMinVelMmPerSecond: globalMinVelMmPerSecond,
-                      globalMaxVelMmPerSecond: globalMaxVelMmPerSecond,
-                    ),
-                    _buildTimeCorrelationTab(result, timeMax),
-                    _buildOverviewTab(
-                      result,
-                      positionTimeMaxSeconds: positionTimeMaxSeconds ?? timeMax,
-                      frontTravelMm: frontTravelMm,
-                      rearTravelMm: rearTravelMm,
-                    ),
-                  ],
-                ),
+              _buildTimeCorrelationTab(result, timeMax),
+              _buildOverviewTab(
+                result,
+                positionTimeMaxSeconds: positionTimeMaxSeconds ?? timeMax,
+                frontTravelMm: frontTravelMm,
+                rearTravelMm: rearTravelMm,
               ),
             ],
           ),
         ),
       ],
+    );
+
+    final Widget content = isCompactLayout
+        ? Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        _showMobileSidebar = !_showMobileSidebar;
+                      });
+                    },
+                    icon: Icon(
+                      _showMobileSidebar ? Icons.tune : Icons.tune_outlined,
+                      size: 18,
+                    ),
+                    label: Text(
+                      _showMobileSidebar ? 'Hide Controls' : 'Show Controls',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ),
+              ),
+              AnimatedCrossFade(
+                duration: const Duration(milliseconds: 180),
+                crossFadeState: _showMobileSidebar
+                    ? CrossFadeState.showFirst
+                    : CrossFadeState.showSecond,
+                firstChild: SizedBox(height: 320, child: sidebar),
+                secondChild: const SizedBox.shrink(),
+              ),
+              const Divider(height: 1),
+              Expanded(child: graphSection),
+            ],
+          )
+        : Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              SizedBox(width: 280, child: sidebar),
+              const VerticalDivider(width: 1),
+              Expanded(child: graphSection),
+            ],
+          );
+
+    return MediaQuery(
+      data: mediaQuery.copyWith(textScaler: TextScaler.linear(textScale)),
+      child: content,
     );
   }
 
