@@ -62,10 +62,29 @@ class _AnalysisTabState extends State<AnalysisTab>
   double _scatGestFocalFracX = 0.5;
   double _scatGestFocalFracY = 0.5;
 
+    // Render-performance state/caches for large logs.
+    bool _isInteractingTime = false;
+    bool _isInteractingScatter = false;
+    final Map<String, List<FlSpot>> _lineSpotCache = <String, List<FlSpot>>{};
+    final Map<String, List<ScatterSpot>> _scatterSpotCache =
+      <String, List<ScatterSpot>>{};
+    final Map<String, List<double>> _distributionValuesCache =
+      <String, List<double>>{};
+
+  Map<PotentiometerChannel, _FftResult>? _fftResults;
+  // Time-window for FFT analysis (null = full data)
+  double? _fftWindowStart;
+  double? _fftWindowEnd;
+  // Which handle is being dragged: 0 = start, 1 = end
+  int? _fftDragHandle;
+
+  static const int _kMaxFftSize = 1 << 15; // 32768
+  static const double _kMaxFreqHz = 1000.0;
+
   @override
   void initState() {
     super.initState();
-    _graphTabController = TabController(length: 3, vsync: this);
+    _graphTabController = TabController(length: 4, vsync: this);
     if (widget.profiles.isNotEmpty) {
       _selectedProfile = widget.profiles.first;
     }
@@ -75,6 +94,282 @@ class _AnalysisTabState extends State<AnalysisTab>
   void dispose() {
     _graphTabController.dispose();
     super.dispose();
+  }
+
+  int get _lineRenderBudget => _isInteractingTime ? 650 : 2200;
+
+  int get _scatterRenderBudget {
+    if (_isInteractingScatter) {
+      return 1200;
+    }
+    if (_isInteractingTime) {
+      return 2200;
+    }
+    return 6500;
+  }
+
+  String _cacheKey(String key, int budget) => '$key|$budget';
+
+  List<FlSpot> _getOrBuildLineSpots(
+    String key,
+    int budget,
+    List<FlSpot> Function(int maxPoints) builder,
+  ) {
+    return _lineSpotCache.putIfAbsent(
+      _cacheKey(key, budget),
+      () => builder(budget),
+    );
+  }
+
+  List<ScatterSpot> _getOrBuildScatterSpots(
+    String key,
+    int budget,
+    List<ScatterSpot> Function(int maxPoints) builder,
+  ) {
+    return _scatterSpotCache.putIfAbsent(
+      _cacheKey(key, budget),
+      () => builder(budget),
+    );
+  }
+
+  List<double> _getOrBuildDistributionValues(
+    String key,
+    List<double> Function() builder,
+  ) {
+    return _distributionValuesCache.putIfAbsent(key, builder);
+  }
+
+  void _clearRenderCaches() {
+    _lineSpotCache.clear();
+    _scatterSpotCache.clear();
+    _distributionValuesCache.clear();
+  }
+
+  // ── FFT computation ─────────────────────────────────────────────────────────
+
+  Map<PotentiometerChannel, _FftResult> _computeFftForResult(
+      AnalysisResult result) {
+    final Map<PotentiometerChannel, _FftResult> out =
+        <PotentiometerChannel, _FftResult>{};
+    for (final MapEntry<PotentiometerChannel, ChannelResult> entry
+        in result.channelResults.entries) {
+      out[entry.key] =
+          _computeChannelFft(entry.value.positionTimePoints);
+    }
+    return out;
+  }
+
+  Map<PotentiometerChannel, _FftResult> _computeWindowedFft(
+      AnalysisResult result, double windowStart, double windowEnd) {
+    final Map<PotentiometerChannel, _FftResult> out =
+        <PotentiometerChannel, _FftResult>{};
+    for (final MapEntry<PotentiometerChannel, ChannelResult> entry
+        in result.channelResults.entries) {
+      final List<PositionTimePoint> windowed = entry.value.positionTimePoints
+          .where((PositionTimePoint p) =>
+              p.timeSeconds >= windowStart && p.timeSeconds <= windowEnd)
+          .toList();
+      out[entry.key] = _computeChannelFft(windowed);
+    }
+    return out;
+  }
+
+  static _FftResult _computeChannelFft(
+      List<PositionTimePoint> points) {
+    const _FftResult empty = _FftResult(
+      frequencies: <double>[],
+      magnitudes: <double>[],
+      phases: <double>[],
+    );
+
+    if (points.length < 4) {
+      return empty;
+    }
+
+    final double timeSpan =
+        points.last.timeSeconds - points.first.timeSeconds;
+    if (timeSpan <= 0.0) {
+      return empty;
+    }
+
+    // Estimate sample rate, clamped to a sensible range.
+    final double detectedRate = (points.length - 1) / timeSpan;
+    final double sampleRate = detectedRate.clamp(1.0, 2500.0);
+
+    // Number of uniformly-spaced samples to feed the FFT.
+    final int uniformCount =
+        math.min((timeSpan * sampleRate).round(), _kMaxFftSize);
+    if (uniformCount < 4) {
+      return empty;
+    }
+
+    // Resample to a uniform grid via linear interpolation.
+    final double dt = timeSpan / (uniformCount - 1);
+    final List<double> signal = List<double>.filled(uniformCount, 0.0);
+    int srcIdx = 0;
+    for (int i = 0; i < uniformCount; i++) {
+      final double t = points.first.timeSeconds + i * dt;
+      while (srcIdx + 1 < points.length - 1 &&
+          points[srcIdx + 1].timeSeconds <= t) {
+        srcIdx++;
+      }
+      final PositionTimePoint p0 = points[srcIdx];
+      if (srcIdx + 1 < points.length) {
+        final PositionTimePoint p1 = points[srcIdx + 1];
+        final double span = p1.timeSeconds - p0.timeSeconds;
+        final double frac =
+            span > 0.0 ? (t - p0.timeSeconds) / span : 0.0;
+        signal[i] = p0.positionMillimeters +
+            frac * (p1.positionMillimeters - p0.positionMillimeters);
+      } else {
+        signal[i] = p0.positionMillimeters;
+      }
+    }
+
+    // Next power of 2 >= uniformCount, capped at _kMaxFftSize.
+    int fftSize = 1;
+    while (fftSize < uniformCount) {
+      fftSize <<= 1;
+    }
+    if (fftSize > _kMaxFftSize) {
+      fftSize = _kMaxFftSize;
+    }
+
+    // Remove DC offset.
+    double mean = 0.0;
+    for (final double v in signal) {
+      mean += v;
+    }
+    mean /= signal.length;
+
+    // Apply Hanning window and fill FFT input arrays.
+    final List<double> re = List<double>.filled(fftSize, 0.0);
+    final List<double> im = List<double>.filled(fftSize, 0.0);
+    double windowSum = 0.0;
+    for (int i = 0; i < uniformCount; i++) {
+      final double w =
+          0.5 * (1.0 - math.cos(2.0 * math.pi * i / (uniformCount - 1)));
+      re[i] = (signal[i] - mean) * w;
+      windowSum += w;
+    }
+    // re[uniformCount..fftSize-1] remain zero-padded.
+
+    _fftInPlace(re, im);
+
+    // Extract one-sided magnitude and phase up to _kMaxFreqHz.
+    final int maxBin = math.min(
+      (_kMaxFreqHz * fftSize / sampleRate).floor(),
+      fftSize >> 1,
+    );
+    final double normFactor =
+        windowSum > 0.0 ? 2.0 / windowSum : 2.0 / fftSize;
+
+    final List<double> freqs = <double>[];
+    final List<double> mags = <double>[];
+    final List<double> phases = <double>[];
+    for (int k = 1; k <= maxBin; k++) {
+      freqs.add(k * sampleRate / fftSize);
+      final double mag =
+          math.sqrt(re[k] * re[k] + im[k] * im[k]) * normFactor;
+      mags.add(mag);
+      phases.add(math.atan2(im[k], re[k]) * 180.0 / math.pi);
+    }
+
+    return _FftResult(frequencies: freqs, magnitudes: mags, phases: phases);
+  }
+
+  /// Returns an upper frequency bound (Hz) that covers all spectral content
+  /// with magnitude ≥ 2 % of the per-channel peak, rounded up to a clean
+  /// boundary.  Used to pre-set the default X range for the FFT charts.
+  static double _computeDominantFrequencyHz(
+      Map<PotentiometerChannel, _FftResult> fftResults) {
+    double maxCutoff = 10.0;
+
+    for (final _FftResult r in fftResults.values) {
+      if (r.magnitudes.isEmpty) {
+        continue;
+      }
+      double peak = 0.0;
+      for (final double m in r.magnitudes) {
+        if (m > peak) peak = m;
+      }
+      if (peak <= 0.0) {
+        continue;
+      }
+      final double threshold = peak * 0.02;
+      // Walk backwards to find the last bin above the threshold.
+      for (int i = r.magnitudes.length - 1; i >= 0; i--) {
+        if (r.magnitudes[i] >= threshold) {
+          if (r.frequencies[i] > maxCutoff) maxCutoff = r.frequencies[i];
+          break;
+        }
+      }
+    }
+
+    // Round up to a visually clean boundary.
+    final double step;
+    if (maxCutoff <= 20) {
+      step = 5;
+    } else if (maxCutoff <= 100) {
+      step = 10;
+    } else if (maxCutoff <= 500) {
+      step = 25;
+    } else {
+      step = 100;
+    }
+    return ((maxCutoff / step).ceil() * step).clamp(10.0, _kMaxFreqHz);
+  }
+
+  static void _fftInPlace(List<double> re, List<double> im) {
+    final int n = re.length;
+    assert(
+        n > 0 && (n & (n - 1)) == 0, 'FFT size must be a power of 2');
+
+    // Bit-reversal permutation.
+    int j = 0;
+    for (int i = 1; i < n; i++) {
+      int bit = n >> 1;
+      while ((j & bit) != 0) {
+        j ^= bit;
+        bit >>= 1;
+      }
+      j ^= bit;
+      if (i < j) {
+        double t = re[i];
+        re[i] = re[j];
+        re[j] = t;
+        t = im[i];
+        im[i] = im[j];
+        im[j] = t;
+      }
+    }
+
+    // Cooley-Tukey iterative butterfly stages.
+    for (int len = 2; len <= n; len <<= 1) {
+      final double ang = -2.0 * math.pi / len;
+      final double wBaseR = math.cos(ang);
+      final double wBaseI = math.sin(ang);
+      for (int i = 0; i < n; i += len) {
+        double wR = 1.0;
+        double wI = 0.0;
+        final int half = len >> 1;
+        for (int k = 0; k < half; k++) {
+          final int u = i + k;
+          final int v = i + k + half;
+          final double uR = re[u];
+          final double uI = im[u];
+          final double vR = re[v] * wR - im[v] * wI;
+          final double vI = re[v] * wI + im[v] * wR;
+          re[u] = uR + vR;
+          im[u] = uI + vI;
+          re[v] = uR - vR;
+          im[v] = uI - vI;
+          final double newWR = wR * wBaseR - wI * wBaseI;
+          wI = wR * wBaseI + wI * wBaseR;
+          wR = newWR;
+        }
+      }
+    }
   }
 
   @override
@@ -103,7 +398,7 @@ class _AnalysisTabState extends State<AnalysisTab>
 
 
     FilePickerResult? selection;
-    const List<String> allowedExtensions = <String>['bin', 'dat', 'raw', 'daq'];
+    const List<String> allowedExtensions = <String>['bin', 'dat', 'raw', 'daq', 'csv', 'txt'];
     final bool useCustomExtensionFilter =
         defaultTargetPlatform != TargetPlatform.iOS;
     try {
@@ -186,11 +481,33 @@ class _AnalysisTabState extends State<AnalysisTab>
         return;
       }
 
+      final Map<PotentiometerChannel, _FftResult> fftResults =
+          _computeFftForResult(result);
+
+      if (!mounted) {
+        return;
+      }
+
+      final double dominantFreqHz = _computeDominantFrequencyHz(fftResults);
+
       setState(() {
         _analysisResult = result;
+        _fftResults = fftResults;
         _timeViewMinX = null;
         _timeViewMaxX = null;
         _scatterViewBounds.clear();
+        // Pre-set the FFT views to the dominant frequency range so the
+        // interesting content fills the chart by default.  Users can pinch
+        // to zoom out to the full 0–1000 Hz range, or double-tap to reset.
+        if (dominantFreqHz < _kMaxFreqHz) {
+          _scatterViewBounds['fft_mag'] =
+              <double?>[0.0, dominantFreqHz, null, null];
+          _scatterViewBounds['fft_phase'] =
+              <double?>[0.0, dominantFreqHz, null, null];
+        }
+        _isInteractingTime = false;
+        _isInteractingScatter = false;
+        _clearRenderCaches();
         _showMobileSidebar = false;
       });
     } catch (error) {
@@ -259,7 +576,7 @@ class _AnalysisTabState extends State<AnalysisTab>
       final double scaledY = point.normalizedTravelPercent;
       spots.add(FlSpot(point.timeSeconds, scaledY));
     }
-    return spots;
+    return _sanitizeTimeSeriesSpots(spots);
   }
 
   List<FlSpot> _buildAttitudeSpots(
@@ -278,7 +595,34 @@ class _AnalysisTabState extends State<AnalysisTab>
       final AttitudeTimePoint point = points[index];
       spots.add(FlSpot(point.timeSeconds, selector(point)));
     }
-    return spots;
+    return _sanitizeTimeSeriesSpots(spots);
+  }
+
+  List<FlSpot> _sanitizeTimeSeriesSpots(List<FlSpot> spots) {
+    if (spots.isEmpty) {
+      return const <FlSpot>[];
+    }
+
+    final List<FlSpot> sanitized = <FlSpot>[];
+    FlSpot? previous;
+
+    for (final FlSpot spot in spots) {
+      if (previous != null && spot.x < previous.x) {
+        // Drop out-of-order samples; parser unwrapping should prevent these,
+        // but filtering here guarantees line monotonicity at render time.
+        continue;
+      }
+
+      // For identical timestamps, keep only the latest sample.
+      if (previous != null && spot.x == previous.x && sanitized.isNotEmpty) {
+        sanitized.removeLast();
+      }
+
+      sanitized.add(spot);
+      previous = spot;
+    }
+
+    return sanitized;
   }
 
   double? _maxChannelTimeSeconds(AnalysisResult result) {
@@ -287,8 +631,9 @@ class _AnalysisTabState extends State<AnalysisTab>
       if (channelResult.positionTimePoints.isEmpty) {
         continue;
       }
-      final double last = channelResult.positionTimePoints.last.timeSeconds;
-      maxTime = maxTime == null ? last : math.max(maxTime, last);
+      for (final PositionTimePoint point in channelResult.positionTimePoints) {
+        maxTime = maxTime == null ? point.timeSeconds : math.max(maxTime, point.timeSeconds);
+      }
     }
     return maxTime;
   }
@@ -297,7 +642,18 @@ class _AnalysisTabState extends State<AnalysisTab>
     if (points.isEmpty) {
       return null;
     }
-    return points.last.timeSeconds;
+    return points
+        .map((AttitudeTimePoint p) => p.timeSeconds)
+        .reduce((double a, double b) => math.max(a, b));
+  }
+
+  double? _maxAccelerationTimeSeconds(List<AccelerationTimePoint> points) {
+    if (points.isEmpty) {
+      return null;
+    }
+    return points
+        .map((AccelerationTimePoint p) => p.timeSeconds)
+        .reduce((double a, double b) => math.max(a, b));
   }
 
   List<FlSpot> _buildAccelSpots(
@@ -314,7 +670,7 @@ class _AnalysisTabState extends State<AnalysisTab>
     for (int i = 0; i < count; i += step) {
       spots.add(FlSpot(points[i].timeSeconds, selector(points[i])));
     }
-    return spots;
+    return _sanitizeTimeSeriesSpots(spots);
   }
 
   // ── new cross-channel spot builders ────────────────────────────────────────
@@ -389,94 +745,143 @@ class _AnalysisTabState extends State<AnalysisTab>
     for (int i = 0; i < count; i += step) {
       spots.add(FlSpot(points[i].timeSeconds, points[i].positionMillimeters));
     }
-    return spots;
+    return _sanitizeTimeSeriesSpots(spots);
   }
 
-  // ── distribution histogram panel ───────────────────────────────────────────
+  // ── overlaid distribution line chart ───────────────────────────────────────
 
-  Widget _buildDistributionPanel({
-    required List<double> values,
-    required Color color,
-    required String label,
+  Widget _buildOverlaidDistributionChart({
+    required List<double> frontValues,
+    required List<double> rearValues,
     required String unit,
-    int bins = 25,
+    required String title,
+    int bins = 150,
+    int smoothRadius = 5,
   }) {
-    if (values.isEmpty) return const SizedBox.shrink();
-    final double minV = values.reduce(math.min);
-    final double maxV = values.reduce(math.max);
+    if (frontValues.isEmpty && rearValues.isEmpty) return const SizedBox.shrink();
+
+    final List<double> allValues = <double>[...frontValues, ...rearValues];
+    final double minV = allValues.reduce(math.min);
+    final double maxV = allValues.reduce(math.max);
     if (maxV <= minV) return const SizedBox.shrink();
 
     final double binWidth = (maxV - minV) / bins;
-    final List<int> counts = List<int>.filled(bins, 0);
-    for (final double v in values) {
-      final int bin = ((v - minV) / binWidth).floor().clamp(0, bins - 1);
-      counts[bin]++;
+
+    List<FlSpot> buildSpots(List<double> values) {
+      if (values.isEmpty) return <FlSpot>[];
+      final List<int> counts = List<int>.filled(bins, 0);
+      for (final double v in values) {
+        final int bin = ((v - minV) / binWidth).floor().clamp(0, bins - 1);
+        counts[bin]++;
+      }
+      final double total = values.length.toDouble();
+      // Gaussian-weighted smoothing using a simple box-kernel approximation.
+      final List<double> smoothed = List<double>.filled(bins, 0);
+      for (int i = 0; i < bins; i++) {
+        double weightSum = 0;
+        double valSum = 0;
+        for (int j = -smoothRadius; j <= smoothRadius; j++) {
+          final int idx = i + j;
+          if (idx < 0 || idx >= bins) continue;
+          final double w = math.exp(-(j * j) / (2.0 * smoothRadius * smoothRadius / 4.0));
+          valSum += counts[idx] * w;
+          weightSum += w;
+        }
+        smoothed[i] = weightSum > 0 ? valSum / weightSum / total * 100 : 0;
+      }
+      return List<FlSpot>.generate(
+        bins,
+        (int i) => FlSpot(minV + (i + 0.5) * binWidth, smoothed[i]),
+      );
     }
-    final double maxCount = counts.reduce(math.max).toDouble();
+
+    final List<FlSpot> frontSpots = buildSpots(frontValues);
+    final List<FlSpot> rearSpots = buildSpots(rearValues);
+
+    final double maxY = <FlSpot>[...frontSpots, ...rearSpots]
+        .map((FlSpot s) => s.y)
+        .fold(0.0, math.max);
+
+    final Color frontColor = _channelColor(PotentiometerChannel.front);
+    final Color rearColor = _channelColor(PotentiometerChannel.rear);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: <Widget>[
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 11,
-            color: color,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
+        Text(title, style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 8),
         SizedBox(
-          height: 120,
-          child: BarChart(
-            BarChartData(
-              barGroups: List<BarChartGroupData>.generate(
-                bins,
-                (int i) => BarChartGroupData(
-                  x: i,
-                  barRods: <BarChartRodData>[
-                    BarChartRodData(
-                      toY: counts[i].toDouble(),
-                      color: color,
-                      width: 5,
-                      borderRadius: BorderRadius.zero,
-                    ),
-                  ],
-                ),
-              ),
-              maxY: maxCount,
-              barTouchData: BarTouchData(enabled: false),
-              gridData: const FlGridData(show: false),
-              borderData: FlBorderData(show: false),
+          height: 180,
+          child: LineChart(
+            LineChartData(
+              lineBarsData: <LineChartBarData>[
+                if (frontSpots.isNotEmpty)
+                  LineChartBarData(
+                    spots: frontSpots,
+                    color: frontColor,
+                    barWidth: 2,
+                    isCurved: true,
+                    curveSmoothness: 0.25,
+                    dotData: const FlDotData(show: false),
+                  ),
+                if (rearSpots.isNotEmpty)
+                  LineChartBarData(
+                    spots: rearSpots,
+                    color: rearColor,
+                    barWidth: 2,
+                    isCurved: true,
+                    curveSmoothness: 0.25,
+                    dotData: const FlDotData(show: false),
+                  ),
+              ],
+              minX: minV,
+              maxX: maxV,
+              minY: 0,
+              maxY: maxY * 1.15,
+              lineTouchData: const LineTouchData(enabled: false),
+              gridData: const FlGridData(show: true),
+              borderData: FlBorderData(
+                  show: true, border: Border.all(color: Colors.black54)),
               titlesData: FlTitlesData(
                 leftTitles: const AxisTitles(
+                  axisNameWidget: Text('%'),
+                  sideTitles: SideTitles(showTitles: true, reservedSize: 40),
+                ),
+                bottomTitles: AxisTitles(
+                  axisNameWidget: Text(unit),
+                  sideTitles: const SideTitles(showTitles: true),
+                ),
+                topTitles: const AxisTitles(
                     sideTitles: SideTitles(showTitles: false)),
                 rightTitles: const AxisTitles(
                     sideTitles: SideTitles(showTitles: false)),
-                topTitles: const AxisTitles(
-                    sideTitles: SideTitles(showTitles: false)),
-                bottomTitles: AxisTitles(
-                  axisNameWidget:
-                      Text(unit, style: const TextStyle(fontSize: 10)),
-                  sideTitles: SideTitles(
-                    showTitles: true,
-                    reservedSize: 18,
-                    getTitlesWidget: (double value, TitleMeta meta) {
-                      final int idx = value.round();
-                      if (idx != 0 && idx != bins ~/ 2 && idx != bins - 1) {
-                        return const SizedBox.shrink();
-                      }
-                      final double val = minV + idx * binWidth;
-                      return Text(
-                        val.toStringAsFixed(0),
-                        style: const TextStyle(fontSize: 9),
-                      );
-                    },
-                  ),
-                ),
               ),
             ),
           ),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: <Widget>[
+            if (frontSpots.isNotEmpty) ...<Widget>[
+              Container(
+                  width: 16,
+                  height: 2,
+                  color: frontColor),
+              const SizedBox(width: 4),
+              const Text('Front', style: TextStyle(fontSize: 11)),
+            ],
+            if (frontSpots.isNotEmpty && rearSpots.isNotEmpty)
+              const SizedBox(width: 12),
+            if (rearSpots.isNotEmpty) ...<Widget>[
+              Container(
+                  width: 16,
+                  height: 2,
+                  color: rearColor),
+              const SizedBox(width: 4),
+              const Text('Rear', style: TextStyle(fontSize: 11)),
+            ],
+          ],
         ),
       ],
     );
@@ -561,6 +966,11 @@ class _AnalysisTabState extends State<AnalysisTab>
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onScaleStart: (ScaleStartDetails d) {
+              if (!_isInteractingTime) {
+                setState(() {
+                  _isInteractingTime = true;
+                });
+              }
               _tcGestureStartMin = _timeViewMinX ?? 0;
               _tcGestureStartMax = _timeViewMaxX ?? fullTimeMax;
               _tcLastChartWidth = bc.maxWidth;
@@ -595,6 +1005,13 @@ class _AnalysisTabState extends State<AnalysisTab>
                 _timeViewMinX = newMin;
                 _timeViewMaxX = newMax;
               });
+            },
+            onScaleEnd: (_) {
+              if (_isInteractingTime) {
+                setState(() {
+                  _isInteractingTime = false;
+                });
+              }
             },
             onDoubleTap: () {
               setState(() {
@@ -646,6 +1063,11 @@ class _AnalysisTabState extends State<AnalysisTab>
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
           onScaleStart: (ScaleStartDetails d) {
+            if (!_isInteractingScatter) {
+              setState(() {
+                _isInteractingScatter = true;
+              });
+            }
             final List<double?> bb = _scatterViewBounds[chartId] ??
                 const <double?>[null, null, null, null];
             _scatGestStartMinX = bb[0] ?? fullMinX;
@@ -688,6 +1110,13 @@ class _AnalysisTabState extends State<AnalysisTab>
                 newMinX, newMaxX, newMinY, newMaxY,
               ];
             });
+          },
+          onScaleEnd: (_) {
+            if (_isInteractingScatter) {
+              setState(() {
+                _isInteractingScatter = false;
+              });
+            }
           },
           onDoubleTap: () {
             setState(() {
@@ -754,160 +1183,134 @@ class _AnalysisTabState extends State<AnalysisTab>
             Text('Rear vs Front Position',
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Expanded(
-                  flex: 3,
-                  child: _wrapWithScatterZoom(
-                    chartId: 'pos',
-                    fullMinX: frontResult.minPositionMillimeters - 1,
-                    fullMaxX: frontResult.maxPositionMillimeters + 1,
-                    fullMinY: rearResult.minPositionMillimeters - 1,
-                    fullMaxY: rearResult.maxPositionMillimeters + 1,
-                    chartHeight: 320,
-                    leftReserved: 48,
-                    builder: (double minX, double maxX, double minY, double maxY) =>
-                        SizedBox(
-                      height: 320,
-                      child: ScatterChart(ScatterChartData(
-                        clipData: FlClipData.all(),
-                        scatterTouchData: _highContrastScatterTouchData(),
-                        minX: minX,
-                        maxX: maxX,
-                        minY: minY,
-                        maxY: maxY,
-                        scatterSpots: _buildFrontVsRearPositionSpots(result),
-                        gridData: const FlGridData(show: true),
-                        borderData: FlBorderData(
-                            show: true,
-                            border: Border.all(color: Colors.black54)),
-                        titlesData: FlTitlesData(
-                          leftTitles: const AxisTitles(
-                            axisNameWidget: Text('Rear (mm)'),
-                            sideTitles:
-                                SideTitles(showTitles: true, reservedSize: 48),
-                          ),
-                          bottomTitles: const AxisTitles(
-                            axisNameWidget: Text('Front (mm)'),
-                            sideTitles: SideTitles(showTitles: true),
-                          ),
-                          topTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false)),
-                          rightTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false)),
-                        ),
-                      )),
+            _wrapWithScatterZoom(
+              chartId: 'pos',
+              fullMinX: frontResult.minPositionMillimeters - 1,
+              fullMaxX: frontResult.maxPositionMillimeters + 1,
+              fullMinY: rearResult.minPositionMillimeters - 1,
+              fullMaxY: rearResult.maxPositionMillimeters + 1,
+              chartHeight: 320,
+              leftReserved: 48,
+              builder: (double minX, double maxX, double minY, double maxY) =>
+                  SizedBox(
+                height: 320,
+                child: ScatterChart(ScatterChartData(
+                  clipData: FlClipData.all(),
+                  scatterTouchData: _highContrastScatterTouchData(),
+                  minX: minX,
+                  maxX: maxX,
+                  minY: minY,
+                  maxY: maxY,
+                  scatterSpots: _getOrBuildScatterSpots(
+                    'trends:front_rear_pos',
+                    _scatterRenderBudget,
+                    (int maxPoints) =>
+                        _buildFrontVsRearPositionSpots(result, maxPoints: maxPoints),
+                  ),
+                  gridData: const FlGridData(show: true),
+                  borderData: FlBorderData(
+                      show: true,
+                      border: Border.all(color: Colors.black54)),
+                  titlesData: FlTitlesData(
+                    leftTitles: const AxisTitles(
+                      axisNameWidget: Text('Rear (mm)'),
+                      sideTitles:
+                          SideTitles(showTitles: true, reservedSize: 48),
                     ),
+                    bottomTitles: const AxisTitles(
+                      axisNameWidget: Text('Front (mm)'),
+                      sideTitles: SideTitles(showTitles: true),
+                    ),
+                    topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false)),
+                    rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false)),
                   ),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 140,
-                  child: Column(
-                    children: <Widget>[
-                      _buildDistributionPanel(
-                        values: frontResult.positionTimePoints
-                            .map((PositionTimePoint p) =>
-                                p.positionMillimeters)
-                            .toList(),
-                        color: _channelColor(PotentiometerChannel.front),
-                        label: 'Front dist.',
-                        unit: 'mm',
-                      ),
-                      const SizedBox(height: 8),
-                      _buildDistributionPanel(
-                        values: rearResult.positionTimePoints
-                            .map((PositionTimePoint p) =>
-                                p.positionMillimeters)
-                            .toList(),
-                        color: _channelColor(PotentiometerChannel.rear),
-                        label: 'Rear dist.',
-                        unit: 'mm',
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+                )),
+              ),
+            ),
+            const SizedBox(height: 24),
+            _buildOverlaidDistributionChart(
+              frontValues: _getOrBuildDistributionValues(
+                'dist:front:pos_mm',
+                () => frontResult.positionTimePoints
+                    .map((PositionTimePoint p) => p.positionMillimeters)
+                    .toList(growable: false),
+              ),
+              rearValues: _getOrBuildDistributionValues(
+                'dist:rear:pos_mm',
+                () => rearResult.positionTimePoints
+                    .map((PositionTimePoint p) => p.positionMillimeters)
+                    .toList(growable: false),
+              ),
+              unit: 'mm',
+              title: 'Position Distribution',
             ),
             const SizedBox(height: 24),
             Text('Rear vs Front Velocity',
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Expanded(
-                  flex: 3,
-                  child: _wrapWithScatterZoom(
-                    chartId: 'vel',
-                    fullMinX: frontResult.minVelocityMillimetersPerSecond - 5,
-                    fullMaxX: frontResult.maxVelocityMillimetersPerSecond + 5,
-                    fullMinY: rearResult.minVelocityMillimetersPerSecond - 5,
-                    fullMaxY: rearResult.maxVelocityMillimetersPerSecond + 5,
-                    chartHeight: 320,
-                    builder: (double minX, double maxX, double minY, double maxY) =>
-                        SizedBox(
-                      height: 320,
-                      child: ScatterChart(ScatterChartData(
-                        clipData: FlClipData.all(),
-                        scatterTouchData: _highContrastScatterTouchData(),
-                        minX: minX,
-                        maxX: maxX,
-                        minY: minY,
-                        maxY: maxY,
-                        scatterSpots: _buildFrontVsRearVelocitySpots(result),
-                        gridData: const FlGridData(show: true),
-                        borderData: FlBorderData(
-                            show: true,
-                            border: Border.all(color: Colors.black54)),
-                        titlesData: FlTitlesData(
-                          leftTitles: const AxisTitles(
-                            axisNameWidget: Text('Rear (mm/s)'),
-                            sideTitles:
-                                SideTitles(showTitles: true, reservedSize: 54),
-                          ),
-                          bottomTitles: const AxisTitles(
-                            axisNameWidget: Text('Front (mm/s)'),
-                            sideTitles: SideTitles(showTitles: true),
-                          ),
-                          topTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false)),
-                          rightTitles: const AxisTitles(
-                              sideTitles: SideTitles(showTitles: false)),
-                        ),
-                      )),
+            _wrapWithScatterZoom(
+              chartId: 'vel',
+              fullMinX: frontResult.minVelocityMillimetersPerSecond - 5,
+              fullMaxX: frontResult.maxVelocityMillimetersPerSecond + 5,
+              fullMinY: rearResult.minVelocityMillimetersPerSecond - 5,
+              fullMaxY: rearResult.maxVelocityMillimetersPerSecond + 5,
+              chartHeight: 320,
+              builder: (double minX, double maxX, double minY, double maxY) =>
+                  SizedBox(
+                height: 320,
+                child: ScatterChart(ScatterChartData(
+                  clipData: FlClipData.all(),
+                  scatterTouchData: _highContrastScatterTouchData(),
+                  minX: minX,
+                  maxX: maxX,
+                  minY: minY,
+                  maxY: maxY,
+                  scatterSpots: _getOrBuildScatterSpots(
+                    'trends:front_rear_vel',
+                    _scatterRenderBudget,
+                    (int maxPoints) =>
+                        _buildFrontVsRearVelocitySpots(result, maxPoints: maxPoints),
+                  ),
+                  gridData: const FlGridData(show: true),
+                  borderData: FlBorderData(
+                      show: true,
+                      border: Border.all(color: Colors.black54)),
+                  titlesData: FlTitlesData(
+                    leftTitles: const AxisTitles(
+                      axisNameWidget: Text('Rear (mm/s)'),
+                      sideTitles:
+                          SideTitles(showTitles: true, reservedSize: 54),
                     ),
+                    bottomTitles: const AxisTitles(
+                      axisNameWidget: Text('Front (mm/s)'),
+                      sideTitles: SideTitles(showTitles: true),
+                    ),
+                    topTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false)),
+                    rightTitles: const AxisTitles(
+                        sideTitles: SideTitles(showTitles: false)),
                   ),
-                ),
-                const SizedBox(width: 12),
-                SizedBox(
-                  width: 140,
-                  child: Column(
-                    children: <Widget>[
-                      _buildDistributionPanel(
-                        values: frontResult.velocityPoints
-                            .map((PositionVelocityPoint p) =>
-                                p.velocityMillimetersPerSecond)
-                            .toList(),
-                        color: _channelColor(PotentiometerChannel.front),
-                        label: 'Front vel. dist.',
-                        unit: 'mm/s',
-                      ),
-                      const SizedBox(height: 8),
-                      _buildDistributionPanel(
-                        values: rearResult.velocityPoints
-                            .map((PositionVelocityPoint p) =>
-                                p.velocityMillimetersPerSecond)
-                            .toList(),
-                        color: _channelColor(PotentiometerChannel.rear),
-                        label: 'Rear vel. dist.',
-                        unit: 'mm/s',
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+                )),
+              ),
+            ),
+            const SizedBox(height: 24),
+            _buildOverlaidDistributionChart(
+              frontValues: _getOrBuildDistributionValues(
+                'dist:front:vel_mms',
+                () => frontResult.velocityPoints
+                    .map((PositionVelocityPoint p) => p.velocityMillimetersPerSecond)
+                    .toList(growable: false),
+              ),
+              rearValues: _getOrBuildDistributionValues(
+                'dist:rear:vel_mms',
+                () => rearResult.velocityPoints
+                    .map((PositionVelocityPoint p) => p.velocityMillimetersPerSecond)
+                    .toList(growable: false),
+              ),
+              unit: 'mm/s',
+              title: 'Velocity Distribution',
             ),
             const SizedBox(height: 24),
           ],
@@ -931,7 +1334,12 @@ class _AnalysisTabState extends State<AnalysisTab>
                 maxX: maxX,
                 minY: minY,
                 maxY: maxY,
-                scatterSpots: _buildAllSpots(result),
+                scatterSpots: _getOrBuildScatterSpots(
+                  'trends:all_pv',
+                  _scatterRenderBudget,
+                  (int maxPoints) =>
+                      _buildAllSpots(result, maxPointsPerChannel: maxPoints),
+                ),
                 gridData: const FlGridData(show: true),
                 borderData: FlBorderData(
                     show: true, border: Border.all(color: Colors.black54)),
@@ -1004,7 +1412,11 @@ class _AnalysisTabState extends State<AnalysisTab>
               maxY: cr.maxPositionMillimeters + 2,
               lineBarsData: <LineChartBarData>[
                 LineChartBarData(
-                  spots: _buildPositionSpotsMm(cr),
+                  spots: _getOrBuildLineSpots(
+                    'time:front_pos',
+                    _lineRenderBudget,
+                    (int maxPoints) => _buildPositionSpotsMm(cr, maxPoints: maxPoints),
+                  ),
                   isCurved: false,
                   color: _channelColor(PotentiometerChannel.front),
                   barWidth: 1.5,
@@ -1036,7 +1448,11 @@ class _AnalysisTabState extends State<AnalysisTab>
               maxY: cr.maxPositionMillimeters + 2,
               lineBarsData: <LineChartBarData>[
                 LineChartBarData(
-                  spots: _buildPositionSpotsMm(cr),
+                  spots: _getOrBuildLineSpots(
+                    'time:rear_pos',
+                    _lineRenderBudget,
+                    (int maxPoints) => _buildPositionSpotsMm(cr, maxPoints: maxPoints),
+                  ),
                   isCurved: false,
                   color: _channelColor(PotentiometerChannel.rear),
                   barWidth: 1.5,
@@ -1092,32 +1508,60 @@ class _AnalysisTabState extends State<AnalysisTab>
                   maxY: accelMax + 0.05,
                   lineBarsData: <LineChartBarData>[
                     LineChartBarData(
-                      spots: _buildAccelSpots(result.accelerationTimePoints,
-                          (AccelerationTimePoint p) => p.accelXG),
+                      spots: _getOrBuildLineSpots(
+                        'time:accel_x',
+                        _lineRenderBudget,
+                        (int maxPoints) => _buildAccelSpots(
+                          result.accelerationTimePoints,
+                          (AccelerationTimePoint p) => p.accelXG,
+                          maxPoints: maxPoints,
+                        ),
+                      ),
                       isCurved: false,
                       color: Colors.red.shade600,
                       barWidth: 1.5,
                       dotData: const FlDotData(show: false),
                     ),
                     LineChartBarData(
-                      spots: _buildAccelSpots(result.accelerationTimePoints,
-                          (AccelerationTimePoint p) => p.accelYG),
+                      spots: _getOrBuildLineSpots(
+                        'time:accel_y',
+                        _lineRenderBudget,
+                        (int maxPoints) => _buildAccelSpots(
+                          result.accelerationTimePoints,
+                          (AccelerationTimePoint p) => p.accelYG,
+                          maxPoints: maxPoints,
+                        ),
+                      ),
                       isCurved: false,
                       color: Colors.green.shade700,
                       barWidth: 1.5,
                       dotData: const FlDotData(show: false),
                     ),
                     LineChartBarData(
-                      spots: _buildAccelSpots(result.accelerationTimePoints,
-                          (AccelerationTimePoint p) => p.accelZG),
+                      spots: _getOrBuildLineSpots(
+                        'time:accel_z',
+                        _lineRenderBudget,
+                        (int maxPoints) => _buildAccelSpots(
+                          result.accelerationTimePoints,
+                          (AccelerationTimePoint p) => p.accelZG,
+                          maxPoints: maxPoints,
+                        ),
+                      ),
                       isCurved: false,
                       color: Colors.blue.shade700,
                       barWidth: 1.5,
                       dotData: const FlDotData(show: false),
                     ),
                     LineChartBarData(
-                      spots: _buildAccelSpots(result.accelerationTimePoints,
-                          (AccelerationTimePoint p) => p.accelAbsoluteG),
+                      spots: _getOrBuildLineSpots(
+                        'time:accel_abs',
+                        _lineRenderBudget,
+                        (int maxPoints) => _buildAccelSpots(
+                          result.accelerationTimePoints,
+                          (AccelerationTimePoint p) => p.accelAbsoluteG,
+                          maxPoints: maxPoints,
+                        ),
+                      ),
                       isCurved: false,
                       color: Colors.grey.shade800,
                       barWidth: 2,
@@ -1156,8 +1600,15 @@ class _AnalysisTabState extends State<AnalysisTab>
               maxY: pitchMax + 2,
               lineBarsData: <LineChartBarData>[
                 LineChartBarData(
-                  spots: _buildAttitudeSpots(result.attitudeTimePoints,
-                      (AttitudeTimePoint p) => p.pitchDegrees),
+                  spots: _getOrBuildLineSpots(
+                    'time:pitch',
+                    _lineRenderBudget,
+                    (int maxPoints) => _buildAttitudeSpots(
+                      result.attitudeTimePoints,
+                      (AttitudeTimePoint p) => p.pitchDegrees,
+                      maxPoints: maxPoints,
+                    ),
+                  ),
                   isCurved: false,
                   color: Colors.teal.shade700,
                   barWidth: 1.5,
@@ -1194,8 +1645,15 @@ class _AnalysisTabState extends State<AnalysisTab>
               maxY: rollMax + 2,
               lineBarsData: <LineChartBarData>[
                 LineChartBarData(
-                  spots: _buildAttitudeSpots(result.attitudeTimePoints,
-                      (AttitudeTimePoint p) => p.leanDegrees),
+                  spots: _getOrBuildLineSpots(
+                    'time:roll',
+                    _lineRenderBudget,
+                    (int maxPoints) => _buildAttitudeSpots(
+                      result.attitudeTimePoints,
+                      (AttitudeTimePoint p) => p.leanDegrees,
+                      maxPoints: maxPoints,
+                    ),
+                  ),
                   isCurved: false,
                   color: Colors.purple.shade700,
                   barWidth: 1.5,
@@ -1326,6 +1784,412 @@ class _AnalysisTabState extends State<AnalysisTab>
     );
   }
 
+  // ── FFT window selector ────────────────────────────────────────────────────
+
+  /// Interactive time-window selector. Draws front and rear position traces,
+  /// a shaded selection region, and two draggable handle lines.
+  Widget _buildFftWindowSelector(AnalysisResult result, double timeMax) {
+    const double kHeight = 110.0;
+    const double kHandleHitSlop = 16.0;
+
+    final ChannelResult? front =
+        result.channelResults[PotentiometerChannel.front];
+    final ChannelResult? rear =
+        result.channelResults[PotentiometerChannel.rear];
+    if (front == null && rear == null) return const SizedBox.shrink();
+
+    double posMin = double.infinity;
+    double posMax = double.negativeInfinity;
+    for (final ChannelResult? cr in <ChannelResult?>[front, rear]) {
+      if (cr == null) continue;
+      if (cr.minPositionMillimeters < posMin) posMin = cr.minPositionMillimeters;
+      if (cr.maxPositionMillimeters > posMax) posMax = cr.maxPositionMillimeters;
+    }
+    final double posRange = (posMax - posMin).abs();
+    if (posRange < 1) return const SizedBox.shrink();
+
+    final Color frontColor = _channelColor(PotentiometerChannel.front);
+    final Color rearColor = _channelColor(PotentiometerChannel.rear);
+
+    return LayoutBuilder(
+      builder: (BuildContext ctx, BoxConstraints constraints) {
+        final double width = constraints.maxWidth;
+        if (width <= 0) return const SizedBox.shrink();
+
+        double tToX(double t) => (t / timeMax * width).clamp(0.0, width);
+        double xToT(double x) => (x / width * timeMax).clamp(0.0, timeMax);
+
+        List<Offset> downsample(List<PositionTimePoint> pts) {
+          if (pts.isEmpty) return const <Offset>[];
+          const int kMax = 800;
+          final int step = pts.length > kMax ? (pts.length / kMax).ceil() : 1;
+          final List<Offset> out = <Offset>[];
+          for (int i = 0; i < pts.length; i += step) {
+            final double x = tToX(pts[i].timeSeconds);
+            final double y = kHeight -
+                (pts[i].positionMillimeters - posMin) / posRange * kHeight;
+            out.add(Offset(x, y.clamp(0.0, kHeight)));
+          }
+          return out;
+        }
+
+        final double winStart = _fftWindowStart ?? 0.0;
+        final double winEnd = _fftWindowEnd ?? timeMax;
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (TapDownDetails d) {
+            final double t = xToT(d.localPosition.dx);
+            final double distStart = (t - winStart).abs();
+            final double distEnd = (t - winEnd).abs();
+            setState(() {
+              if (distStart < distEnd) {
+                _fftWindowStart = t.clamp(0.0, winEnd - 0.01);
+              } else {
+                _fftWindowEnd = t.clamp(winStart + 0.01, timeMax);
+              }
+            });
+            _recomputeWindowedFft(result);
+          },
+          onPanStart: (DragStartDetails d) {
+            final double x = d.localPosition.dx;
+            if ((x - tToX(winStart)).abs() <= kHandleHitSlop) {
+              _fftDragHandle = 0;
+            } else if ((x - tToX(winEnd)).abs() <= kHandleHitSlop) {
+              _fftDragHandle = 1;
+            } else {
+              _fftDragHandle = null;
+            }
+          },
+          onPanUpdate: (DragUpdateDetails d) {
+            if (_fftDragHandle == null) return;
+            final double t = xToT(d.localPosition.dx);
+            setState(() {
+              if (_fftDragHandle == 0) {
+                _fftWindowStart =
+                    t.clamp(0.0, (_fftWindowEnd ?? timeMax) - 0.01);
+              } else {
+                _fftWindowEnd =
+                    t.clamp((_fftWindowStart ?? 0.0) + 0.01, timeMax);
+              }
+            });
+          },
+          onPanEnd: (_) {
+            _fftDragHandle = null;
+            _recomputeWindowedFft(result);
+          },
+          child: SizedBox(
+            width: width,
+            height: kHeight,
+            child: CustomPaint(
+              size: Size(width, kHeight),
+              painter: _FftWindowPainter(
+                frontPoints: front == null
+                    ? const <Offset>[]
+                    : downsample(front.positionTimePoints),
+                rearPoints: rear == null
+                    ? const <Offset>[]
+                    : downsample(rear.positionTimePoints),
+                frontColor: frontColor,
+                rearColor: rearColor,
+                windowStartX: tToX(winStart),
+                windowEndX: tToX(winEnd),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _recomputeWindowedFft(AnalysisResult result) {
+    final double? ws = _fftWindowStart;
+    final double? we = _fftWindowEnd;
+    if (ws == null || we == null || we <= ws) {
+      // No valid window — fall back to full-data FFT.
+      setState(() {
+        _fftResults = _computeFftForResult(result);
+      });
+    } else {
+      setState(() {
+        _fftResults = _computeWindowedFft(result, ws, we);
+        // Reset chart zoom to data-driven default.
+        _scatterViewBounds.remove('fft_mag');
+        _scatterViewBounds.remove('fft_phase');
+      });
+    }
+  }
+
+  // ── tab 4: Frequency Analysis ────────────────────────────────────────────────
+
+  Widget _buildFrequencyAnalysisTab(AnalysisResult result, double timeMax) {
+    final Map<PotentiometerChannel, _FftResult>? fftResults = _fftResults;
+    if (fftResults == null || fftResults.isEmpty) {
+      return const Center(
+        child: Text('Frequency analysis not available for this file.'),
+      );
+    }
+
+    // Gaussian smoothing over a raw value array.
+    List<double> gaussianSmooth(List<double> values, int radius) {
+      final int n = values.length;
+      if (n == 0) return values;
+      final List<double> out = List<double>.filled(n, 0);
+      final double sigma2 = (radius * radius) / 4.0;
+      for (int i = 0; i < n; i++) {
+        double weightSum = 0;
+        double valSum = 0;
+        for (int j = -radius; j <= radius; j++) {
+          final int idx = i + j;
+          if (idx < 0 || idx >= n) continue;
+          final double w = math.exp(-(j * j) / (2.0 * sigma2));
+          valSum += values[idx] * w;
+          weightSum += w;
+        }
+        out[i] = weightSum > 0 ? valSum / weightSum : 0;
+      }
+      return out;
+    }
+
+    List<FlSpot> buildSpots(
+        List<double> freqs, List<double> values, int budget) {
+      final int count = freqs.length;
+      if (count == 0) return const <FlSpot>[];
+      final int step = count > budget ? (count / budget).ceil() : 1;
+      final List<FlSpot> spots = <FlSpot>[];
+      for (int i = 0; i < count; i += step) {
+        spots.add(FlSpot(freqs[i], values[i]));
+      }
+      return spots;
+    }
+
+    // Smoothing radius: ~0.5% of the bin count so it scales with FFT size.
+    const int kSpectrumBudget = 4096;
+    const int kSmoothRadius = 20;
+
+    // Global max magnitude for Y-axis scaling (from smoothed data).
+    double maxMag = 0.0;
+    final Map<PotentiometerChannel, List<double>> smoothedMags =
+        <PotentiometerChannel, List<double>>{};
+    final Map<PotentiometerChannel, List<double>> smoothedPhases =
+        <PotentiometerChannel, List<double>>{};
+    for (final MapEntry<PotentiometerChannel, _FftResult> entry
+        in fftResults.entries) {
+      final List<double> sm =
+          gaussianSmooth(entry.value.magnitudes, kSmoothRadius);
+      final List<double> sp =
+          gaussianSmooth(entry.value.phases, kSmoothRadius);
+      smoothedMags[entry.key] = sm;
+      smoothedPhases[entry.key] = sp;
+      for (final double m in sm) {
+        if (m > maxMag) maxMag = m;
+      }
+    }
+    if (maxMag < 0.01) maxMag = 1.0;
+
+    final List<LineChartBarData> magBars = <LineChartBarData>[];
+    final List<LineChartBarData> phaseBars = <LineChartBarData>[];
+
+    for (final MapEntry<PotentiometerChannel, _FftResult> entry
+        in fftResults.entries) {
+      final Color color = _channelColor(entry.key);
+      final _FftResult r = entry.value;
+      if (r.frequencies.isEmpty) continue;
+      magBars.add(LineChartBarData(
+        spots: buildSpots(
+            r.frequencies, smoothedMags[entry.key]!, kSpectrumBudget),
+        isCurved: true,
+        curveSmoothness: 0.15,
+        color: color,
+        barWidth: 1.5,
+        dotData: const FlDotData(show: false),
+      ));
+      phaseBars.add(LineChartBarData(
+        spots: buildSpots(
+            r.frequencies, smoothedPhases[entry.key]!, kSpectrumBudget),
+        isCurved: true,
+        curveSmoothness: 0.15,
+        color: color,
+        barWidth: 1.0,
+        dotData: const FlDotData(show: false),
+      ));
+    }
+
+    FlTitlesData makeTitles(
+        {required String xLabel, required String yLabel}) {
+      return FlTitlesData(
+        leftTitles: AxisTitles(
+          axisNameWidget: Text(yLabel),
+          sideTitles:
+              const SideTitles(showTitles: true, reservedSize: 54),
+        ),
+        bottomTitles: AxisTitles(
+          axisNameWidget: Text(xLabel),
+          sideTitles:
+              const SideTitles(showTitles: true, reservedSize: 22),
+        ),
+        topTitles:
+            const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+        rightTitles:
+            const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+      );
+    }
+
+    const double kChartHeight = 300.0;
+    final double defaultMaxFreqHz =
+        _computeDominantFrequencyHz(fftResults);
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          // ── time-window selector ──────────────────────────────────────────
+          Text('Analysis Window',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            'Drag the handles to select a time window for the FFT. '
+            'Tap anywhere to move the nearest handle.',
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.black26),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            clipBehavior: Clip.hardEdge,
+            child: _buildFftWindowSelector(result, timeMax),
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: <Widget>[
+              if (_fftWindowStart != null || _fftWindowEnd != null)
+                TextButton.icon(
+                  icon: const Icon(Icons.clear, size: 16),
+                  label: const Text('Reset window'),
+                  onPressed: () {
+                    setState(() {
+                      _fftWindowStart = null;
+                      _fftWindowEnd = null;
+                      _fftResults = _computeFftForResult(result);
+                      _scatterViewBounds.remove('fft_mag');
+                      _scatterViewBounds.remove('fft_phase');
+                    });
+                  },
+                ),
+              const Spacer(),
+              Builder(builder: (BuildContext ctx) {
+                final double ws = _fftWindowStart ?? 0.0;
+                final double we = _fftWindowEnd ?? timeMax;
+                return Text(
+                  '${ws.toStringAsFixed(2)} s – ${we.toStringAsFixed(2)} s'
+                  '  (${(we - ws).toStringAsFixed(2)} s)',
+                  style: const TextStyle(fontSize: 12),
+                );
+              }),
+            ],
+          ),
+          const Divider(height: 24),
+          // ── channel legend ────────────────────────────────────────────────
+          Row(
+            children: <Widget>[
+              ...fftResults.keys
+                  .map((PotentiometerChannel ch) => Padding(
+                        padding: const EdgeInsets.only(right: 16),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            Container(
+                                width: 12,
+                                height: 12,
+                                color: _channelColor(ch)),
+                            const SizedBox(width: 6),
+                            Text(ch.name.toUpperCase(),
+                                style: const TextStyle(fontSize: 12)),
+                          ],
+                        ),
+                      )),
+              const Expanded(
+                child: Text(
+                  'Pinch to zoom  \u2022  Double-tap to reset',
+                  textAlign: TextAlign.right,
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text('Magnitude Spectrum',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _wrapWithScatterZoom(
+            chartId: 'fft_mag',
+            fullMinX: 0,
+            fullMaxX: defaultMaxFreqHz,
+            fullMinY: 0,
+            fullMaxY: maxMag * 1.1,
+            chartHeight: kChartHeight,
+            builder: (double minX, double maxX, double minY,
+                    double maxY) =>
+                SizedBox(
+              height: kChartHeight,
+              child: LineChart(LineChartData(
+                clipData: FlClipData.all(),
+                lineTouchData: _highContrastLineTouchData(),
+                minX: minX,
+                maxX: maxX,
+                minY: minY,
+                maxY: maxY,
+                lineBarsData: magBars,
+                gridData: const FlGridData(show: true),
+                borderData: FlBorderData(
+                    show: true,
+                    border: Border.all(color: Colors.black54)),
+                titlesData: makeTitles(
+                    xLabel: 'Frequency (Hz)',
+                    yLabel: 'Amplitude (mm)'),
+              )),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text('Phase Spectrum',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _wrapWithScatterZoom(
+            chartId: 'fft_phase',
+            fullMinX: 0,
+            fullMaxX: defaultMaxFreqHz,
+            fullMinY: -180,
+            fullMaxY: 180,
+            chartHeight: kChartHeight,
+            builder: (double minX, double maxX, double minY,
+                    double maxY) =>
+                SizedBox(
+              height: kChartHeight,
+              child: LineChart(LineChartData(
+                clipData: FlClipData.all(),
+                lineTouchData: _highContrastLineTouchData(),
+                minX: minX,
+                maxX: maxX,
+                minY: minY,
+                maxY: maxY,
+                lineBarsData: phaseBars,
+                gridData: const FlGridData(show: true),
+                borderData: FlBorderData(
+                    show: true,
+                    border: Border.all(color: Colors.black54)),
+                titlesData: makeTitles(
+                    xLabel: 'Frequency (Hz)', yLabel: 'Phase (deg)'),
+              )),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── tab 3: Overview ─────────────────────────────────────────────────────────
 
   Widget _buildOverviewTab(
@@ -1385,7 +2249,12 @@ class _AnalysisTabState extends State<AnalysisTab>
                     .map(
                         (MapEntry<PotentiometerChannel, ChannelResult> entry) {
                   return LineChartBarData(
-                    spots: _buildScaledPositionSpots(entry.value),
+                    spots: _getOrBuildLineSpots(
+                      'overview:${entry.key.name}:scaled_pos',
+                      _lineRenderBudget,
+                      (int maxPoints) =>
+                          _buildScaledPositionSpots(entry.value, maxPoints: maxPoints),
+                    ),
                     isCurved: false,
                     color: _channelColor(entry.key),
                     barWidth: 2,
@@ -1493,7 +2362,7 @@ class _AnalysisTabState extends State<AnalysisTab>
 
     double? accelMaxSeconds;
     if (result != null && result.accelerationTimePoints.isNotEmpty) {
-      accelMaxSeconds = result.accelerationTimePoints.last.timeSeconds;
+      accelMaxSeconds = _maxAccelerationTimeSeconds(result.accelerationTimePoints);
     }
     double? attitudeMaxSeconds;
     if (result != null) {
@@ -1669,6 +2538,7 @@ class _AnalysisTabState extends State<AnalysisTab>
             Tab(text: 'Trends'),
             Tab(text: 'Time Correlation'),
             Tab(text: 'Overview'),
+            Tab(text: 'Frequency'),
           ],
         ),
         Expanded(
@@ -1690,6 +2560,7 @@ class _AnalysisTabState extends State<AnalysisTab>
                 frontTravelMm: frontTravelMm,
                 rearTravelMm: rearTravelMm,
               ),
+              _buildFrequencyAnalysisTab(result, timeMax),
             ],
           ),
         ),
@@ -1758,6 +2629,101 @@ class _AnalysisTabState extends State<AnalysisTab>
       ],
     );
   }
+}
+
+class _FftResult {
+  const _FftResult({
+    required this.frequencies,
+    required this.magnitudes,
+    required this.phases,
+  });
+
+  final List<double> frequencies; // Hz, 1 Hz to _kMaxFreqHz
+  final List<double> magnitudes;  // mm (amplitude-normalised)
+  final List<double> phases;      // degrees, -180 to 180
+}
+
+// ── FFT window selector painter ──────────────────────────────────────────────
+
+class _FftWindowPainter extends CustomPainter {
+  const _FftWindowPainter({
+    required this.frontPoints,
+    required this.rearPoints,
+    required this.frontColor,
+    required this.rearColor,
+    required this.windowStartX,
+    required this.windowEndX,
+  });
+
+  final List<Offset> frontPoints;
+  final List<Offset> rearPoints;
+  final Color frontColor;
+  final Color rearColor;
+  final double windowStartX;
+  final double windowEndX;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final double w = size.width;
+    final double h = size.height;
+
+    // Dimmed overlay outside the selection window.
+    final Paint dimPaint = Paint()
+      ..color = Colors.black.withAlpha(40)
+      ..style = PaintingStyle.fill;
+    canvas.drawRect(Rect.fromLTRB(0, 0, windowStartX, h), dimPaint);
+    canvas.drawRect(Rect.fromLTRB(windowEndX, 0, w, h), dimPaint);
+
+    // Selected region border.
+    final Paint windowBorderPaint = Paint()
+      ..color = Colors.blueAccent.withAlpha(180)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5;
+    canvas.drawRect(
+        Rect.fromLTRB(windowStartX, 0, windowEndX, h), windowBorderPaint);
+
+    // Draw signal traces.
+    void drawTrace(List<Offset> pts, Color color) {
+      if (pts.length < 2) return;
+      final Paint tracePaint = Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..strokeJoin = StrokeJoin.round;
+      final Path path = Path()..moveTo(pts[0].dx, pts[0].dy);
+      for (int i = 1; i < pts.length; i++) {
+        path.lineTo(pts[i].dx, pts[i].dy);
+      }
+      canvas.drawPath(path, tracePaint);
+    }
+
+    drawTrace(rearPoints, rearColor);
+    drawTrace(frontPoints, frontColor);
+
+    // Handle lines.
+    final Paint handlePaint = Paint()
+      ..color = Colors.blueAccent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+    canvas.drawLine(
+        Offset(windowStartX, 0), Offset(windowStartX, h), handlePaint);
+    canvas.drawLine(
+        Offset(windowEndX, 0), Offset(windowEndX, h), handlePaint);
+
+    // Handle grip dots.
+    final Paint dotPaint = Paint()
+      ..color = Colors.blueAccent
+      ..style = PaintingStyle.fill;
+    canvas.drawCircle(Offset(windowStartX, h / 2), 5, dotPaint);
+    canvas.drawCircle(Offset(windowEndX, h / 2), 5, dotPaint);
+  }
+
+  @override
+  bool shouldRepaint(_FftWindowPainter old) =>
+      old.windowStartX != windowStartX ||
+      old.windowEndX != windowEndX ||
+      old.frontPoints != frontPoints ||
+      old.rearPoints != rearPoints;
 }
 
 class _SummaryCard extends StatelessWidget {

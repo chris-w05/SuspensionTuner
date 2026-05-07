@@ -2,15 +2,16 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_MPU6050.h>
 
 struct ImuSample
 {
-    int16_t accel_x_raw;
-    int16_t accel_y_raw;
-    int16_t accel_z_raw;
-    int16_t gyro_x_raw;
-    int16_t gyro_y_raw;
-    int16_t gyro_z_raw;
+    float accel_x;
+    float accel_y;
+    float accel_z;
+    float gyro_x;
+    float gyro_y;
+    float gyro_z;
 };
 
 class Mpu6050Imu
@@ -21,11 +22,6 @@ public:
     bool read_sample(ImuSample &imu_sample);
 
 private:
-    bool write_register(uint8_t register_address, uint8_t value);
-    bool read_register(uint8_t register_address, uint8_t &value);
-    bool read_bytes(uint8_t start_register, uint8_t *buffer, size_t byte_count);
-
-    TwoWire *wire_ = nullptr;
-    uint8_t address_ = 0;
+    Adafruit_MPU6050 mpu_device_;
     bool is_available_ = false;
 };

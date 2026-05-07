@@ -1,6 +1,11 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../models/calibration_profile.dart';
+import '../services/arduino_calibration_import_service.dart';
 
 class SetupTab extends StatefulWidget {
   const SetupTab({
@@ -21,6 +26,9 @@ class SetupTab extends StatefulWidget {
 }
 
 class _SetupTabState extends State<SetupTab> {
+  final ArduinoCalibrationImportService _calibrationImportService =
+      ArduinoCalibrationImportService();
+
   bool _isFormOpen = false;
   String? _editingProfileId;
   bool _frontEnabled = true;
@@ -224,6 +232,100 @@ class _SetupTabState extends State<SetupTab> {
     }
   }
 
+  Future<void> _importArduinoCalibration() async {
+    FilePickerResult? selection;
+    const List<String> allowedExtensions = <String>[
+      'bin',
+      'dat',
+      'cal',
+      'eeprom',
+      'txt',
+      'log',
+    ];
+    final bool useCustomExtensionFilter =
+        defaultTargetPlatform != TargetPlatform.iOS;
+
+    try {
+      selection = await FilePicker.platform.pickFiles(
+        type: useCustomExtensionFilter ? FileType.custom : FileType.any,
+        allowedExtensions: useCustomExtensionFilter ? allowedExtensions : null,
+        withData: true,
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not open file picker: $error')),
+      );
+      return;
+    }
+
+    if (selection == null || selection.files.isEmpty) {
+      return;
+    }
+
+    final PlatformFile file = selection.files.single;
+    Uint8List? bytes = file.bytes;
+    if (bytes == null && file.path != null) {
+      try {
+        bytes = await File(file.path!).readAsBytes();
+      } catch (error) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not read selected file: $error')),
+        );
+        return;
+      }
+    }
+
+    if (bytes == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not load selected file data.')),
+        );
+      }
+      return;
+    }
+
+    try {
+      final ArduinoCalibrationData calibration =
+          _calibrationImportService.parse(bytes);
+
+      if (!_isFormOpen || _editingProfileId != null) {
+        _openNewProfileForm();
+      }
+
+      setState(() {
+        _frontEnabled = true;
+        _rearEnabled = true;
+        _frontExtendedAdcController.text = calibration.frontExtended.toString();
+        _frontCompressedAdcController.text = calibration.frontCompressed.toString();
+        _rearExtendedAdcController.text = calibration.rearExtended.toString();
+        _rearCompressedAdcController.text = calibration.rearCompressed.toString();
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Arduino calibration imported. Review side lengths and side C values before saving.',
+            ),
+          ),
+        );
+      }
+    } on FormatException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    }
+  }
+
   PotentiometerCalibration _buildCalibration({
     required String sideAText,
     required String sideBText,
@@ -273,6 +375,12 @@ class _SetupTabState extends State<SetupTab> {
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const Spacer(),
+              OutlinedButton.icon(
+                onPressed: _importArduinoCalibration,
+                icon: const Icon(Icons.upload_file_outlined),
+                label: const Text('Import CAL.BIN'),
+              ),
+              const SizedBox(width: 8),
               FilledButton.icon(
                 onPressed: _openNewProfileForm,
                 icon: const Icon(Icons.add),
