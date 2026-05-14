@@ -131,6 +131,40 @@ class DaqParserService {
     double integratedPitchDegrees = 0.0;
     double integratedLeanDegrees = 0.0;
 
+    // Pre-compute leverage conversion for the rear channel (if configured).
+    // All position and velocity values for the rear are stored in wheel space
+    // so every downstream consumer (charts, recommendations) gets wheel data.
+    final bool rearHasCurve;
+    final double rearScalarLr;
+    final double? rearWheelTravelMm;
+    final List<double> rearShockTable;
+    final List<double> rearWheelTable;
+    {
+      final List<LeverageCurvePoint>? curve = profile.rearLeverageCurve;
+      final PotentiometerCalibration? rearCal =
+          calibrations[PotentiometerChannel.rear];
+      if (rearCal != null && curve != null && curve.length >= 2) {
+        rearHasCurve = true;
+        final (List<double> s, List<double> w) = _buildShockToWheelMap(curve);
+        rearShockTable = s;
+        rearWheelTable = w;
+        rearWheelTravelMm = curve.last.wheelTravelMm;
+        rearScalarLr = 1.0;
+      } else if (rearCal != null && profile.rearLeverageRate != null) {
+        rearHasCurve = false;
+        rearScalarLr = profile.rearLeverageRate!;
+        rearShockTable = <double>[];
+        rearWheelTable = <double>[];
+        rearWheelTravelMm = rearCal.travelMillimeters * rearScalarLr;
+      } else {
+        rearHasCurve = false;
+        rearScalarLr = 1.0;
+        rearShockTable = <double>[];
+        rearWheelTable = <double>[];
+        rearWheelTravelMm = null;
+      }
+    }
+
     for (final _DecodedRecord record in records) {
       final int rawTimestampMicroseconds = record.timestampMicroseconds;
       if (previousRawTimestampMicroseconds != null &&
@@ -152,10 +186,18 @@ class DaqParserService {
         final int rawAdc =
             channel == PotentiometerChannel.front ? frontRaw : rearRaw;
         final PotentiometerCalibration calibration = calibrations[channel]!;
-        final double positionMillimeters =
+        double positionMillimeters =
             calibration.mapAdcToPositionMillimeters(rawAdc);
-        final double normalizedTravelPercent =
-            calibration.mapAdcToPositionPercent(rawAdc);
+        final double normalizedTravelPercent;
+        if (channel == PotentiometerChannel.rear && rearWheelTravelMm != null) {
+          positionMillimeters = rearHasCurve
+              ? _interpolate(rearShockTable, rearWheelTable, positionMillimeters)
+              : positionMillimeters * rearScalarLr;
+          normalizedTravelPercent =
+              (positionMillimeters / rearWheelTravelMm * 100.0).clamp(0.0, 100.0);
+        } else {
+          normalizedTravelPercent = calibration.mapAdcToPositionPercent(rawAdc);
+        }
 
         positionTimePointsMap[channel]!.add(
           PositionTimePoint(
@@ -272,7 +314,10 @@ class DaqParserService {
             .reduce((double a, double b) => math.min(a, b)),
         maxVelocityMillimetersPerSecond: velocityValues
             .reduce((double a, double b) => math.max(a, b)),
-        travelMillimeters: calibration.travelMillimeters,
+        travelMillimeters: (channel == PotentiometerChannel.rear &&
+                rearWheelTravelMm != null)
+            ? rearWheelTravelMm
+            : calibration.travelMillimeters,
       );
     }
 
@@ -588,6 +633,36 @@ class DaqParserService {
       gyroXDegPerSecond: gyroXDegPerSecond,
       gyroYDegPerSecond: gyroYDegPerSecond,
     );
+  }
+
+  (List<double>, List<double>) _buildShockToWheelMap(List<LeverageCurvePoint> curve) {
+    final List<double> shockMm = <double>[0.0];
+    final List<double> wheelMm = <double>[curve.first.wheelTravelMm];
+    for (int i = 1; i < curve.length; i++) {
+      final double dw = curve[i].wheelTravelMm - curve[i - 1].wheelTravelMm;
+      final double avgLr =
+          (curve[i].leverageRatio + curve[i - 1].leverageRatio) / 2.0;
+      shockMm.add(shockMm.last + dw / avgLr);
+      wheelMm.add(curve[i].wheelTravelMm);
+    }
+    return (shockMm, wheelMm);
+  }
+
+  double _interpolate(List<double> xTable, List<double> yTable, double x) {
+    if (x <= xTable.first) return yTable.first;
+    if (x >= xTable.last) return yTable.last;
+    int lo = 0;
+    int hi = xTable.length - 1;
+    while (hi - lo > 1) {
+      final int mid = (lo + hi) ~/ 2;
+      if (xTable[mid] <= x) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    final double t = (x - xTable[lo]) / (xTable[hi] - xTable[lo]);
+    return yTable[lo] + t * (yTable[hi] - yTable[lo]);
   }
 
   int _crc16Ccitt(Uint8List data, int start, int length) {

@@ -1,8 +1,46 @@
 import 'dart:math' as math;
 
+/// One point on an imported leverage curve.
+///
+/// [wheelTravelMm] is the wheel travel at this point in mm.
+/// [leverageRatio] is the instantaneous leverage ratio (wheel speed / shock speed)
+/// at that point — identical to how Linkage X3 reports it.
+class LeverageCurvePoint {
+  const LeverageCurvePoint({
+    required this.wheelTravelMm,
+    required this.leverageRatio,
+  });
+
+  final double wheelTravelMm;
+  final double leverageRatio;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'wheelTravelMm': wheelTravelMm,
+        'leverageRatio': leverageRatio,
+      };
+
+  factory LeverageCurvePoint.fromJson(Map<String, dynamic> json) {
+    return LeverageCurvePoint(
+      wheelTravelMm: (json['wheelTravelMm'] as num).toDouble(),
+      leverageRatio: (json['leverageRatio'] as num).toDouble(),
+    );
+  }
+}
+
 enum PotentiometerChannel {
   front,
   rear,
+}
+
+enum SuspensionAdjustment {
+  airPressureOrSpringRate,
+  volumeReducers,
+  negativeAirSpringVolume,
+  lowSpeedRebound,
+  highSpeedRebound,
+  lowSpeedCompression,
+  highSpeedCompression,
+  hydraulicBottomOut,
 }
 
 class PotentiometerCalibration {
@@ -105,13 +143,47 @@ class CalibrationProfile {
     required this.frontCalibration,
     required this.rearCalibration,
     required this.createdAtMilliseconds,
-  });
+    Set<SuspensionAdjustment>? frontAdjustments,
+    Set<SuspensionAdjustment>? rearAdjustments,
+    this.frontTargetSagPercent,
+    this.rearTargetSagPercent,
+    this.rearLeverageRate,
+    this.rearLeverageCurve,
+  })  : frontAdjustments = frontAdjustments ?? <SuspensionAdjustment>{},
+        rearAdjustments = rearAdjustments ?? <SuspensionAdjustment>{};
 
   final String id;
   final String name;
   final PotentiometerCalibration? frontCalibration;
   final PotentiometerCalibration? rearCalibration;
   final int createdAtMilliseconds;
+  final Set<SuspensionAdjustment> frontAdjustments;
+  final Set<SuspensionAdjustment> rearAdjustments;
+
+  /// Desired sag as a percentage of total travel (0–100), or null if not set.
+  final double? frontTargetSagPercent;
+  final double? rearTargetSagPercent;
+
+  /// Average leverage rate for the rear suspension: wheel travel divided by
+  /// shock travel. Used to convert shock measurements to wheel-travel
+  /// equivalents. Null when not configured.
+  final double? rearLeverageRate;
+
+  /// Full leverage curve imported from Linkage X3. Each point maps a wheel
+  /// travel position (mm) to the instantaneous leverage ratio at that point.
+  final List<LeverageCurvePoint>? rearLeverageCurve;
+
+  /// Resolved leverage rate, applying priority: direct scalar > average of
+  /// imported curve > null.
+  double? get effectiveRearLeverageRate {
+    if (rearLeverageRate != null) return rearLeverageRate;
+    final List<LeverageCurvePoint>? curve = rearLeverageCurve;
+    if (curve != null && curve.isNotEmpty) {
+      return curve.fold(0.0, (double sum, LeverageCurvePoint p) => sum + p.leverageRatio) /
+          curve.length;
+    }
+    return null;
+  }
 
   /// Returns null when the channel is not configured in this profile.
   PotentiometerCalibration? calibrationForChannel(PotentiometerChannel channel) {
@@ -132,6 +204,14 @@ class CalibrationProfile {
       'frontCalibration': frontCalibration?.toJson(),
       'rearCalibration': rearCalibration?.toJson(),
       'createdAtMilliseconds': createdAtMilliseconds,
+      'frontAdjustments': frontAdjustments.map((SuspensionAdjustment a) => a.name).toList(),
+      'rearAdjustments': rearAdjustments.map((SuspensionAdjustment a) => a.name).toList(),
+      'frontTargetSagPercent': frontTargetSagPercent,
+      'rearTargetSagPercent': rearTargetSagPercent,
+      'rearLeverageRate': rearLeverageRate,
+      'rearLeverageCurve': rearLeverageCurve
+          ?.map((LeverageCurvePoint p) => p.toJson())
+          .toList(),
     };
   }
 
@@ -148,6 +228,34 @@ class CalibrationProfile {
           ? PotentiometerCalibration.fromJson(rearJson)
           : null,
       createdAtMilliseconds: (json['createdAtMilliseconds'] as num).toInt(),
+      frontAdjustments: _parseAdjustments(json['frontAdjustments']),
+      rearAdjustments: _parseAdjustments(json['rearAdjustments']),
+      frontTargetSagPercent: (json['frontTargetSagPercent'] as num?)?.toDouble(),
+      rearTargetSagPercent: (json['rearTargetSagPercent'] as num?)?.toDouble(),
+      rearLeverageRate: (json['rearLeverageRate'] as num?)?.toDouble(),
+      rearLeverageCurve: (json['rearLeverageCurve'] as List<dynamic>?)
+          ?.map((Object? e) =>
+              LeverageCurvePoint.fromJson(e as Map<String, dynamic>))
+          .toList(),
     );
+  }
+
+  static Set<SuspensionAdjustment> _parseAdjustments(Object? value) {
+    if (value is! List<dynamic>) {
+      return <SuspensionAdjustment>{};
+    }
+    final Set<SuspensionAdjustment> result = <SuspensionAdjustment>{};
+    for (final Object? item in value) {
+      if (item is! String) {
+        continue;
+      }
+      for (final SuspensionAdjustment adjustment in SuspensionAdjustment.values) {
+        if (adjustment.name == item) {
+          result.add(adjustment);
+          break;
+        }
+      }
+    }
+    return result;
   }
 }

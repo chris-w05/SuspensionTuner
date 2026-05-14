@@ -115,9 +115,26 @@ void setup()
 	Serial.println("Suspension DAQ startup");
 
 	Wire.begin();
+
 	const bool imu_found = imu_sensor.begin(Wire, config::imu_i2c_address);
 	Serial.print("IMU present: ");
 	Serial.println(imu_found ? "yes" : "no");
+
+	if (imu_found)
+	{
+		const float imu_sample_rate_hz =
+			1000000.0f / static_cast<float>(config::sample_interval_microseconds);
+		const ImuFilterDiagnostics filter_diagnostics =
+			imu_sensor.set_low_pass_cutoff(config::imu_filter_cutoff_hz, imu_sample_rate_hz);
+
+		Serial.print("IMU low-pass: 4th-order Butterworth, ");
+		Serial.print(config::imu_filter_cutoff_hz, 0);
+		Serial.print(" Hz cutoff, phase lag at cutoff: ");
+		Serial.print(filter_diagnostics.phase_lag_at_cutoff_deg, 1);
+		Serial.print(" deg / ");
+		Serial.print(filter_diagnostics.phase_lag_at_cutoff_ms, 2);
+		Serial.println(" ms");
+	}
 
 	is_sd_ready = initialize_sd_card();
 	Serial.print("SD card ready: ");

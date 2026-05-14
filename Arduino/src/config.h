@@ -16,6 +16,7 @@ constexpr uint16_t calibration_min_span_counts = 32;
 constexpr uint32_t debug_plot_interval_ms = 2;
 
 constexpr uint8_t imu_i2c_address = 0x68;
+constexpr float imu_filter_cutoff_hz = 100.0f;
 
 constexpr const char *data_file_prefix = "/RUN";
 constexpr const char *data_file_extension = ".CSV";
