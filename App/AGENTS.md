@@ -52,7 +52,7 @@ The two tabs are `SetupTab` (index 0) and `AnalysisTab` (index 1) inside a `Defa
 | `PotentiometerCalibration` | Immutable geometry calibration for one channel. Holds sides A, B, C (mm) and the ADC counts at each endpoint. Exposes `mapAdcToPositionMillimeters(int)` and `mapAdcToPositionPercent(int)`. |
 | `CalibrationProfile` | Named collection of up to two `PotentiometerCalibration` objects. Serialised to/from JSON. `configuredChannels` returns only the non-null channels. |
 
-Default fixed side length: 145 mm. `_calculateAngleDegrees` uses the law of cosines and throws `FormatException` on degenerate triangles.
+Default fixed side length: 145 mm. `_calculateAngleDegrees` uses the law of cosines to compute the potentiometer angle at B (between sides A and C, opposite side B) and throws `FormatException` on degenerate triangles.
 
 ---
 

@@ -4,8 +4,8 @@
 
 namespace pins
 {
-constexpr uint8_t potentiometer_front_pin = A0;
-constexpr uint8_t potentiometer_rear_pin = A1; //Same as front for now - only one sensor is attached
+constexpr uint8_t potentiometer_front_pin = 15;
+constexpr uint8_t potentiometer_rear_pin = 14; //Same as front for now - only one sensor is attached
 constexpr uint8_t acquisition_switch_pin = 3;
 constexpr uint8_t calibration_switch_pin = 5;
 constexpr uint8_t acquisition_indicator_light_pin = 4;

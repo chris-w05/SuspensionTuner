@@ -76,6 +76,17 @@ class PotentiometerCalibrationCard extends StatelessWidget {
             ),
             if (enabled) ...<Widget>[
               const SizedBox(height: 12),
+              Text(
+                'Potentiometer reads the angle at B, between Side A and Side C. '
+                'Side B is opposite that measured angle and is used to compute the geometry.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 8),
+              const SizedBox(
+                height: 120,
+                child: _PotentiometerGeometryDiagram(),
+              ),
+              const SizedBox(height: 12),
               Row(
                 children: <Widget>[
                   Expanded(child: _mmField(sideAController, 'Side A (mm)')),
@@ -346,4 +357,70 @@ class _LeverageCurveChart extends StatelessWidget {
       ),
     );
   }
+}
+
+class _PotentiometerGeometryDiagram extends StatelessWidget {
+  const _PotentiometerGeometryDiagram({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _PotentiometerGeometryPainter(Theme.of(context).colorScheme),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _PotentiometerGeometryPainter extends CustomPainter {
+  const _PotentiometerGeometryPainter(this.colors);
+
+  final ColorScheme colors;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint linePaint = Paint()
+      ..color = colors.onSurfaceVariant
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    final Paint accentPaint = Paint()
+      ..color = colors.primary
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    final Paint dotPaint = Paint()..color = colors.primary;
+
+    final Offset vertexA = Offset(size.width * 0.15, size.height * 0.2);
+    final Offset vertexC = Offset(size.width * 0.85, size.height * 0.2);
+    final Offset vertexB = Offset(size.width * 0.5, size.height * 0.85);
+
+    canvas.drawLine(vertexA, vertexB, linePaint);
+    canvas.drawLine(vertexB, vertexC, linePaint);
+    canvas.drawLine(vertexA, vertexC, linePaint);
+
+    final Offset sideAMid = Offset.lerp(vertexA, vertexB, 0.55)!;
+    final Offset sideCMid = Offset.lerp(vertexB, vertexC, 0.55)!;
+    final Offset sideBMid = Offset.lerp(vertexA, vertexC, 0.5)!;
+
+    const double arcRadius = 30;
+    final Rect arcRect = Rect.fromCircle(center: vertexB, radius: arcRadius);
+    canvas.drawArc(arcRect, -2.3, 1.3, false, accentPaint);
+    canvas.drawCircle(vertexB, 4, dotPaint);
+
+    final TextStyle labelStyle = TextStyle(fontSize: 12, color: colors.onSurface);
+    _drawText(canvas, 'Side A', sideAMid + const Offset(-24, 0), labelStyle);
+    _drawText(canvas, 'Side C', sideCMid + const Offset(8, 0), labelStyle);
+    _drawText(canvas, 'Side B', sideBMid + const Offset(-20, -18), labelStyle);
+    _drawText(canvas, 'Angle B', vertexB + const Offset(-24, 20), labelStyle);
+  }
+
+  void _drawText(Canvas canvas, String text, Offset offset, TextStyle style) {
+    final TextSpan span = TextSpan(text: text, style: style);
+    final TextPainter tp = TextPainter(
+      text: span,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, offset);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

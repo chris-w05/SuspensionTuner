@@ -10,6 +10,13 @@
 #include "imu_mpu6050.h"
 #include "pins.h"
 
+static bool serial_logging_enabled = false;
+
+#define LOG_PRINT(...) \
+    do { if (serial_logging_enabled) { Serial.print(__VA_ARGS__); } } while (0)
+#define LOG_PRINTLN(...) \
+    do { if (serial_logging_enabled) { Serial.println(__VA_ARGS__); } } while (0)
+
 namespace
 {
 struct DebouncedSwitch
@@ -100,25 +107,23 @@ void setup()
 {
 	pinMode(pins::acquisition_indicator_light_pin, OUTPUT);
 	digitalWrite(pins::acquisition_indicator_light_pin, LOW);
-
+	digitalWrite(LED_BUILTIN, LOW);
 	initialize_switch(acquisition_switch, pins::acquisition_switch_pin);
 	initialize_switch(calibration_switch, pins::calibration_switch_pin);
 
 	analogReadResolution(config::analog_resolution_bits);
 
 	Serial.begin(config::serial_baud_rate);
-	while (!Serial && millis() < 4000)
-	{
-		;
-	}
+	delay(100);
+	serial_logging_enabled = Serial;
 
-	Serial.println("Suspension DAQ startup");
+	LOG_PRINTLN("Suspension DAQ startup");
 
 	Wire.begin();
 
 	const bool imu_found = imu_sensor.begin(Wire, config::imu_i2c_address);
-	Serial.print("IMU present: ");
-	Serial.println(imu_found ? "yes" : "no");
+	LOG_PRINT("IMU present: ");
+	LOG_PRINTLN(imu_found ? "yes" : "no");
 
 	if (imu_found)
 	{
@@ -127,20 +132,29 @@ void setup()
 		const ImuFilterDiagnostics filter_diagnostics =
 			imu_sensor.set_low_pass_cutoff(config::imu_filter_cutoff_hz, imu_sample_rate_hz);
 
-		Serial.print("IMU low-pass: 4th-order Butterworth, ");
-		Serial.print(config::imu_filter_cutoff_hz, 0);
-		Serial.print(" Hz cutoff, phase lag at cutoff: ");
-		Serial.print(filter_diagnostics.phase_lag_at_cutoff_deg, 1);
-		Serial.print(" deg / ");
-		Serial.print(filter_diagnostics.phase_lag_at_cutoff_ms, 2);
-		Serial.println(" ms");
+		LOG_PRINT("IMU low-pass: 4th-order Butterworth, ");
+		LOG_PRINT(config::imu_filter_cutoff_hz, 0);
+		LOG_PRINT(" Hz cutoff, phase lag at cutoff: ");
+		LOG_PRINT(filter_diagnostics.phase_lag_at_cutoff_deg, 1);
+		LOG_PRINT(" deg / ");
+		LOG_PRINT(filter_diagnostics.phase_lag_at_cutoff_ms, 2);
+		LOG_PRINTLN(" ms");
 	}
 
-	is_sd_ready = initialize_sd_card();
-	Serial.print("SD card ready: ");
-	Serial.println(is_sd_ready ? "yes" : "no");
+	while (!is_sd_ready && millis() < 3000){
+		is_sd_ready = initialize_sd_card();
+	}
+	LOG_PRINT("SD card ready: ");
+	LOG_PRINTLN(is_sd_ready ? "yes" : "no");
 
 	load_calibration();
+	if( is_sd_ready){
+		digitalWrite(LED_BUILTIN, HIGH);
+	}
+	else{
+		digitalWrite(LED_BUILTIN, LOW);
+	}
+	
 }
 
 void loop()
@@ -215,19 +229,19 @@ void start_acquisition()
 {
 	if (!is_sd_ready)
 	{
-		Serial.println("Cannot start acquisition: SD card unavailable");
+		LOG_PRINTLN("Cannot start acquisition: SD card unavailable");
 		return;
 	}
 
 	if (!open_next_acquisition_file())
 	{
-		Serial.println("Cannot start acquisition: failed to create data file");
+		LOG_PRINTLN("Cannot start acquisition: failed to create data file");
 		return;
 	}
 
 	if (!write_acquisition_csv_header())
 	{
-		Serial.println("Cannot start acquisition: failed to write CSV header");
+		LOG_PRINTLN("Cannot start acquisition: failed to write CSV header");
 		close_acquisition_file();
 		return;
 	}
@@ -237,8 +251,8 @@ void start_acquisition()
 	last_sample_write_time_us = micros();
 	digitalWrite(pins::acquisition_indicator_light_pin, HIGH);
 
-	Serial.print("Acquisition started: file index ");
-	Serial.println(active_file_index);
+	LOG_PRINT("Acquisition started: file index ");
+	LOG_PRINTLN(active_file_index);
 }
 
 bool write_acquisition_csv_header()
@@ -258,7 +272,7 @@ void stop_acquisition()
 	is_acquisition_active = false;
 	close_acquisition_file();
 	digitalWrite(pins::acquisition_indicator_light_pin, LOW);
-	Serial.println("Acquisition stopped");
+	LOG_PRINTLN("Acquisition stopped");
 }
 
 void initialize_switch(DebouncedSwitch &input_switch, uint8_t pin)
@@ -385,15 +399,15 @@ void enter_calibration_mode()
 	is_calibration_mode_active = true;
 	potentiometer_calibration = {};
 
-	Serial.println("Calibration mode entered");
-	Serial.println("ACQ=OFF: front  ACQ=ON: rear  |  CAL rise: extended  CAL fall: compressed");
-	Serial.println("Press both switches together to exit");
+	LOG_PRINTLN("Calibration mode entered");
+	LOG_PRINTLN("ACQ=OFF: front  ACQ=ON: rear  |  CAL rise: extended  CAL fall: compressed");
+	LOG_PRINTLN("Press both switches together to exit");
 }
 
 void exit_calibration_mode()
 {
 	is_calibration_mode_active = false;
-	Serial.println("Calibration mode exited without saving");
+	LOG_PRINTLN("Calibration mode exited without saving");
 }
 
 void handle_calibration_mode_actions()
@@ -420,7 +434,7 @@ void handle_calibration_mode_actions()
 
 	if (!is_calibration_valid())
 	{
-		Serial.println("Calibration invalid: endpoint span too small, retrying");
+		LOG_PRINTLN("Calibration invalid: endpoint span too small, retrying");
 		potentiometer_calibration = {};
 		return;
 	}
@@ -428,7 +442,7 @@ void handle_calibration_mode_actions()
 	save_calibration();
 	print_calibration_summary();
 	is_calibration_mode_active = false;
-	Serial.println("Calibration complete");
+	LOG_PRINTLN("Calibration complete");
 }
 
 void capture_calibration_point(bool capture_rear, bool capture_extended)
@@ -443,15 +457,15 @@ void capture_calibration_point(bool capture_rear, bool capture_extended)
 		{
 			potentiometer_calibration.front_extended = raw_value;
 			potentiometer_calibration.has_front_extended = true;
-			Serial.print("Captured front extended: ");
-			Serial.println(raw_value);
+			LOG_PRINT("Captured front extended: ");
+			LOG_PRINTLN(raw_value);
 		}
 		else
 		{
 			potentiometer_calibration.front_compressed = raw_value;
 			potentiometer_calibration.has_front_compressed = true;
-			Serial.print("Captured front compressed: ");
-			Serial.println(raw_value);
+			LOG_PRINT("Captured front compressed: ");
+			LOG_PRINTLN(raw_value);
 		}
 		return;
 	}
@@ -460,15 +474,15 @@ void capture_calibration_point(bool capture_rear, bool capture_extended)
 	{
 		potentiometer_calibration.rear_extended = raw_value;
 		potentiometer_calibration.has_rear_extended = true;
-		Serial.print("Captured rear extended: ");
-		Serial.println(raw_value);
+		LOG_PRINT("Captured rear extended: ");
+		LOG_PRINTLN(raw_value);
 	}
 	else
 	{
 		potentiometer_calibration.rear_compressed = raw_value;
 		potentiometer_calibration.has_rear_compressed = true;
-		Serial.print("Captured rear compressed: ");
-		Serial.println(raw_value);
+		LOG_PRINT("Captured rear compressed: ");
+		LOG_PRINTLN(raw_value);
 	}
 }
 
@@ -493,15 +507,15 @@ bool is_calibration_valid()
 
 void print_calibration_summary()
 {
-	Serial.println("Calibration summary");
-	Serial.print("Front extended: ");
-	Serial.println(potentiometer_calibration.front_extended);
-	Serial.print("Front compressed: ");
-	Serial.println(potentiometer_calibration.front_compressed);
-	Serial.print("Rear extended: ");
-	Serial.println(potentiometer_calibration.rear_extended);
-	Serial.print("Rear compressed: ");
-	Serial.println(potentiometer_calibration.rear_compressed);
+	LOG_PRINTLN("Calibration summary");
+	LOG_PRINT("Front extended: ");
+	LOG_PRINTLN(potentiometer_calibration.front_extended);
+	LOG_PRINT("Front compressed: ");
+	LOG_PRINTLN(potentiometer_calibration.front_compressed);
+	LOG_PRINT("Rear extended: ");
+	LOG_PRINTLN(potentiometer_calibration.rear_extended);
+	LOG_PRINT("Rear compressed: ");
+	LOG_PRINTLN(potentiometer_calibration.rear_compressed);
 }
 
 void load_calibration()
@@ -511,7 +525,7 @@ void load_calibration()
 
 	if (stored_calibration.magic != calibration_magic)
 	{
-		Serial.println("No valid EEPROM calibration, trying SD card");
+		LOG_PRINTLN("No valid EEPROM calibration, trying SD card");
 
 		if (is_sd_ready && SD.exists(config::calibration_file_name))
 		{
@@ -521,7 +535,7 @@ void load_calibration()
 				cal_file.read(reinterpret_cast<uint8_t *>(&stored_calibration),
 							  sizeof(stored_calibration));
 				cal_file.close();
-				Serial.println("Calibration read from SD card");
+				LOG_PRINTLN("Calibration read from SD card");
 			}
 			else
 			{
@@ -529,19 +543,19 @@ void load_calibration()
 				{
 					cal_file.close();
 				}
-				Serial.println("SD calibration file unreadable");
+				LOG_PRINTLN("SD calibration file unreadable");
 				return;
 			}
 		}
 		else
 		{
-			Serial.println("No stored calibration found");
+			LOG_PRINTLN("No stored calibration found");
 			return;
 		}
 
 		if (stored_calibration.magic != calibration_magic)
 		{
-			Serial.println("SD calibration file has invalid magic, ignoring");
+			LOG_PRINTLN("SD calibration file has invalid magic, ignoring");
 			return;
 		}
 	}
@@ -558,12 +572,12 @@ void load_calibration()
 
 	if (!is_calibration_valid())
 	{
-		Serial.println("Stored calibration invalid, ignoring");
+		LOG_PRINTLN("Stored calibration invalid, ignoring");
 		potentiometer_calibration = {};
 		return;
 	}
 
-	Serial.println("Stored calibration loaded");
+	LOG_PRINTLN("Stored calibration loaded");
 	print_calibration_summary();
 }
 
@@ -577,7 +591,7 @@ void save_calibration()
 	stored_calibration.rear_compressed = potentiometer_calibration.rear_compressed;
 
 	EEPROM.put(0, stored_calibration);
-	Serial.println("Calibration saved to EEPROM");
+	LOG_PRINTLN("Calibration saved to EEPROM");
 
 	if (is_sd_ready)
 	{
@@ -591,25 +605,25 @@ void save_calibration()
 			cal_file.write(reinterpret_cast<const uint8_t *>(&stored_calibration),
 						   sizeof(stored_calibration));
 			cal_file.close();
-			Serial.println("Calibration saved to SD card");
+			LOG_PRINTLN("Calibration saved to SD card");
 		}
 		else
 		{
-			Serial.println("Failed to write calibration to SD card");
+			LOG_PRINTLN("Failed to write calibration to SD card");
 		}
 	}
 }
 
 void print_debug_plot()
 {
-	Serial.print(">acq_switch:");
-	Serial.print(acquisition_switch.is_stable_pressed ? 1 : 0);
-	Serial.print(",cal_switch:");
-	Serial.print(calibration_switch.is_stable_pressed ? 1 : 0);
-	Serial.print(",acquiring:");
-	Serial.print(is_acquisition_active ? 1 : 0);
-	Serial.print(",calibrating:");
-	Serial.println(is_calibration_mode_active ? 1 : 0);
+	LOG_PRINT(">acq_switch:");
+	LOG_PRINT(acquisition_switch.is_stable_pressed ? 1 : 0);
+	LOG_PRINT(",cal_switch:");
+	LOG_PRINT(calibration_switch.is_stable_pressed ? 1 : 0);
+	LOG_PRINT(",acquiring:");
+	LOG_PRINT(is_acquisition_active ? 1 : 0);
+	LOG_PRINT(",calibrating:");
+	LOG_PRINTLN(is_calibration_mode_active ? 1 : 0);
 }
 
 void write_one_sample()
@@ -686,7 +700,7 @@ void write_one_sample()
 	const size_t bytes_written = acquisition_file.println(status_flags);
 	if (bytes_written == 0)
 	{
-		Serial.println("Write error: stopping acquisition");
+		LOG_PRINTLN("Write error: stopping acquisition");
 		stop_acquisition();
 		return;
 	}

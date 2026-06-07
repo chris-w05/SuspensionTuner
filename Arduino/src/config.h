@@ -6,7 +6,7 @@
 namespace config
 {
 constexpr uint32_t serial_baud_rate = 115200;
-constexpr uint16_t analog_resolution_bits = 12;
+constexpr uint16_t analog_resolution_bits = 24;
 
 constexpr uint32_t button_debounce_time_ms = 40;
 constexpr uint32_t file_flush_interval_ms = 100;

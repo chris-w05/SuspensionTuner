@@ -50,7 +50,7 @@ class PotentiometerCalibration {
     required this.extendedSideC,
     required this.extendedAdc,
     required this.compressedSideC,
-    required this.compressedAdc,
+    required this.compressedAdc
   });
 
   static const double defaultFixedSideLength = 145.0;
@@ -68,6 +68,9 @@ class PotentiometerCalibration {
   double get compressedAngleDegrees =>
       _calculateAngleDegrees(sideA, sideB, compressedSideC);
 
+  double get adcSpan =>
+      (compressedAdc - extendedAdc).toDouble();
+    
     double get travelMillimeters =>
       (compressedSideC - extendedSideC).abs();
 
@@ -75,8 +78,6 @@ class PotentiometerCalibration {
     if (extendedAdc == compressedAdc) {
       throw const FormatException('Extended and compressed ADC values cannot be equal.');
     }
-
-    final double adcSpan = (compressedAdc - extendedAdc).toDouble();
     final double t = (rawAdc - extendedAdc) / adcSpan;
     final double angleAtRaw =
         extendedAngleDegrees + t * (compressedAngleDegrees - extendedAngleDegrees);
@@ -84,14 +85,18 @@ class PotentiometerCalibration {
     final double low = math.min(extendedAngleDegrees, compressedAngleDegrees);
     final double high = math.max(extendedAngleDegrees, compressedAngleDegrees);
     final double clampedAngle = angleAtRaw.clamp(low, high);
+    final double gamma = 180 - 2*clampedAngle; //Find angle across the triangle from side c
+    // Dynamically calculate current side C length using law of cosines
+    final double currentSideC = _calculateSideCLength(sideA, sideB, gamma);
 
-    final double denominator = compressedAngleDegrees - extendedAngleDegrees;
-    if (denominator == 0) {
+    // Position as fraction of total travel
+    final double travelSpan = compressedSideC - extendedSideC;
+    if (travelSpan == 0) {
       throw const FormatException(
-          'Invalid calibration: compressed and extended angles are equal.');
+          'Invalid calibration: compressed and extended side C are equal.');
     }
 
-    final double normalized = (clampedAngle - extendedAngleDegrees) / denominator;
+    final double normalized = (currentSideC - extendedSideC) / travelSpan;
     return (normalized * 100.0).clamp(0.0, 100.0);
   }
 
@@ -129,10 +134,20 @@ class PotentiometerCalibration {
     if (a + b <= c || a + c <= b || b + c <= a) {
       throw const FormatException('Invalid triangle dimensions for calibration.');
     }
-    final double numerator = (a * a) + (b * b) - (c * c);
-    final double denominator = 2.0 * a * b;
+    // The potentiometer measures the angle at the joint between sides A and C.
+    // That measured angle is opposite side B, so the law of cosines is applied
+    // across A and C using B as the opposite side.
+    final double numerator = (a * a) + (c * c) - (b * b);
+    final double denominator = 2.0 * a * c;
     final double cosine = (numerator / denominator).clamp(-1.0, 1.0);
     return math.acos(cosine) * 180.0 / math.pi;
+  }
+
+  static double _calculateSideCLength(double a, double b, double angleBDegrees) {
+    final double angleBRadians = angleBDegrees * math.pi / 180.0;
+    final double cosB = math.cos(angleBRadians);
+    final double cSquared = a * a + b * b - 2 * a * b * cosB;
+    return math.sqrt(cSquared.clamp(0.0, double.infinity));
   }
 }
 
